@@ -62,7 +62,7 @@ NAME_MAP = {
     "Chris Smith":        "Christopher Smith",
     "joe bellefeuille":   "Joseph Bellefeuille",
 }
-DEFAULT_TARGETS = Path(__file__).parent / "Final Client Sales Targets 2026 - Leader File - 6-23-26 (2).xlsx"
+DEFAULT_TARGETS = Path(__file__).parent / "targets_2026.xlsx"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CSS
