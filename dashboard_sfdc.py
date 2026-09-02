@@ -6,7 +6,8 @@ engine, and renders an interactive monthly performance dashboard.
 Run:  streamlit run dashboard_sfdc.py
 """
 
-import io, re, warnings
+import io, json, re, warnings
+from calendar import monthrange
 from datetime import datetime
 from pathlib import Path
 
@@ -140,17 +141,46 @@ def sf_connect_session(session_id, instance_url="https://sapconcur.my.salesforce
     return Salesforce(session_id=session_id, instance_url=instance_url)
 
 
-def sf_run_report(sf, report_id):
-    """GET Analytics API; return (DataFrame, row_count)."""
-    result = sf.restful(
-        path=f"analytics/reports/{report_id}",
-        method="GET",
-        params={"includeDetails": "true"},
-    )
-    rpt_type = result.get("reportMetadata", {}).get("reportFormat", "TABULAR")
-    if rpt_type not in ("TABULAR",):
-        # Summary / matrix: fall back to tabular columns
-        pass
+def sf_run_report(sf, report_id, start_date=None, end_date=None):
+    """Run a Salesforce Analytics report and return (DataFrame, row_count).
+
+    If start_date / end_date (YYYY-MM-DD strings) are supplied the function
+    attempts a POST to override the report's standard date filter to that exact
+    range.  This keeps results well under the 2,000-row API cap regardless of
+    how the report is configured in Salesforce.  Falls back to a plain GET if
+    the POST is rejected for any reason.
+    """
+    params = {"includeDetails": "true"}
+    result = None
+
+    if start_date and end_date:
+        try:
+            body = json.dumps({
+                "reportMetadata": {
+                    "standardDateFilter": {
+                        "column":        "CLOSE_DATE",
+                        "durationValue": "CUSTOM",
+                        "startDate":     start_date,
+                        "endDate":       end_date,
+                    }
+                }
+            })
+            result = sf.restful(
+                path=f"analytics/reports/{report_id}",
+                method="POST",
+                data=body,
+                params=params,
+            )
+        except Exception:
+            result = None   # fall through to GET
+
+    if result is None:
+        result = sf.restful(
+            path=f"analytics/reports/{report_id}",
+            method="GET",
+            params=params,
+        )
+
     meta   = result.get("reportMetadata", {})
     ext    = result.get("reportExtendedMetadata", {})
     fmap   = result.get("factMap", {})
@@ -161,9 +191,30 @@ def sf_run_report(sf, report_id):
     records = []
     for row in rows:
         cells = row.get("dataCells", [])
-        records.append({labels[i]: _cell_val(cells[i]) for i in range(min(len(labels),len(cells)))})
+        records.append({labels[i]: _cell_val(cells[i])
+                        for i in range(min(len(labels), len(cells)))})
     df = pd.DataFrame(records)
     return df, len(records)
+
+
+def sf_run_report_multi(sf, report_id, month_nums, year):
+    """Run a report one month at a time and concatenate results.
+
+    Makes len(month_nums) POST calls, each scoped to a single calendar month,
+    so each response stays well under the 2,000-row Salesforce Analytics API
+    cap.  Falls back to GET per month if POST is rejected.
+    Returns (combined DataFrame, total row count).
+    """
+    dfs = []
+    for m in month_nums:
+        start    = f"{year}-{m:02d}-01"
+        last_day = monthrange(year, m)[1]
+        end      = f"{year}-{m:02d}-{last_day:02d}"
+        df, _    = sf_run_report(sf, report_id, start, end)
+        if len(df) > 0:
+            dfs.append(df)
+    combined = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+    return combined, len(combined)
 
 
 def _cell_val(cell):
@@ -619,13 +670,16 @@ with st.sidebar:
         elif st.session_state.tgt_bytes is None:
             st.error("Please upload the Quota Targets file.")
         else:
-            with st.spinner("Running Salesforce reports…"):
+            n_months = len(month_nums)
+            with st.spinner(f"Running Salesforce reports… ({n_months} month{'s' if n_months>1 else ''})"):
                 try:
-                    sf = st.session_state.sf
-                    cw_df,  n1 = sf_run_report(sf, rpt_cw)
-                    ltc_df, n2 = sf_run_report(sf, rpt_ltc)
-                    ret_df, n3 = sf_run_report(sf, rpt_ret)
-                    comp_df,n4 = sf_run_report(sf, rpt_comp)
+                    sf   = st.session_state.sf
+                    _yr  = int(sel_year)
+
+                    cw_df,  n1 = sf_run_report_multi(sf, rpt_cw,   month_nums, _yr)
+                    ltc_df, n2 = sf_run_report_multi(sf, rpt_ltc,  month_nums, _yr)
+                    ret_df, n3 = sf_run_report_multi(sf, rpt_ret,  month_nums, _yr)
+                    comp_df,n4 = sf_run_report_multi(sf, rpt_comp, month_nums, _yr)
                     st.session_state.raw_cw   = cw_df
                     st.session_state.raw_ltc  = ltc_df
                     st.session_state.raw_ret  = ret_df
