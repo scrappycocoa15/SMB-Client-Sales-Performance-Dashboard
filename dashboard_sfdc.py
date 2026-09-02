@@ -394,10 +394,14 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
     rep_grp["Region"]  = rep_grp.apply(resolve_region, axis=1)
     rep_grp["Segment"] = rep_grp.apply(resolve_segment, axis=1)
     rep_grp["VP"]      = rep_grp["Segment"].map(VP_MAP).fillna("N/A")
+    # Force numeric dtype before division — outer merge can leave object columns
+    for _c in ["CW_ARR","LTC_Credit","Retention_Credit","Complete_Credit","CW_Units"]:
+        rep_grp[_c] = pd.to_numeric(rep_grp[_c], errors="coerce").fillna(0)
     rep_grp["Total_Credited"] = (rep_grp["CW_ARR"] + rep_grp["LTC_Credit"]
                                  + rep_grp["Retention_Credit"] + rep_grp["Complete_Credit"])
-    rep_grp["Monthly_Quota"] = rep_grp["Rep"].map(
-        lambda r: rep_quota_map.get(r, 0) * monthly_factor)
+    rep_grp["Monthly_Quota"] = pd.to_numeric(
+        rep_grp["Rep"].map(lambda r: rep_quota_map.get(r, 0) * monthly_factor),
+        errors="coerce").fillna(0)
     rep_grp["Pct_to_Linearity"] = np.where(
         rep_grp["Monthly_Quota"] > 0,
         rep_grp["Total_Credited"] / rep_grp["Monthly_Quota"], np.nan)
@@ -417,7 +421,9 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
         Total_Credited  = ("Total_Credited",   "sum"),
         CW_Units        = ("CW_Units",         "sum"),
     ).reset_index()
-    ldr_grp["Monthly_Quota"] = ldr_grp["Leader"].map(lambda l: ldr_quota_map.get(l, 0))
+    ldr_grp["Monthly_Quota"] = pd.to_numeric(
+        ldr_grp["Leader"].map(lambda l: ldr_quota_map.get(l, 0)),
+        errors="coerce").fillna(0)
     ldr_grp["Pct_to_Linearity"] = np.where(
         ldr_grp["Monthly_Quota"] > 0,
         ldr_grp["Total_Credited"] / ldr_grp["Monthly_Quota"], np.nan)
@@ -431,9 +437,10 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
         Total_Credited  = ("Total_Credited",   "sum"),
         CW_Units        = ("CW_Units",         "sum"),
     ).reset_index()
-    seg_grp["PL_Quota"]   = seg_grp["Segment"].map(seg_pl)
-    seg_grp["Lin_Target"] = seg_grp["Segment"].map(
-        lambda s: sum(ldr_quota_map.get(l,0) for l,sg in LEADER_SEGMENT.items() if sg==s))
+    seg_grp["PL_Quota"]   = pd.to_numeric(seg_grp["Segment"].map(seg_pl),   errors="coerce").fillna(0)
+    seg_grp["Lin_Target"] = pd.to_numeric(seg_grp["Segment"].map(
+        lambda s: sum(ldr_quota_map.get(l,0) for l,sg in LEADER_SEGMENT.items() if sg==s)),
+        errors="coerce").fillna(0)
     seg_grp["Pct_to_PL"]  = np.where(seg_grp["PL_Quota"]>0,
         seg_grp["Total_Credited"]/seg_grp["PL_Quota"], np.nan)
     seg_grp["Pct_to_Lin"] = np.where(seg_grp["Lin_Target"]>0,
