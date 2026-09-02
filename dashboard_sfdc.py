@@ -144,67 +144,106 @@ def sf_connect_session(session_id, instance_url="https://sapconcur.my.salesforce
 def sf_run_report(sf, report_id, start_date=None, end_date=None):
     """Run a Salesforce Analytics report and return (DataFrame, row_count).
 
-    When start_date / end_date are supplied the function POSTs with TWO
-    independent date-scoping mechanisms so the range is honoured regardless of
-    how each individual report is configured in Salesforce:
+    Two sequential POST attempts are made — never mixed in one body — so each
+    mechanism is isolated and a failure in one does not break the other:
 
-      1. standardDateFilter override  – works when the report uses the built-in
-         'standard' date filter (e.g. LTC, Complete).
-      2. reportFilters addition       – works for reports that use a custom
-         date filter instead of the standard one (e.g. CW ARR).  The Salesforce
-         Analytics API *appends* reportFilters to the report's existing saved
-         filters rather than replacing them, so Stage / Type / other criteria
-         are always preserved.
+      Attempt 1 — standardDateFilter
+        Overrides the report's built-in Standard Date Filter.
+        Works for LTC, Complete, Retention (which have std date filter on Close Date).
+        If Salesforce silently ignores it (report has no std date filter), the
+        response still succeeds but returns 2 000 rows (the API cap) — detected
+        by a row-count check and treated the same as an exception.
 
-    Falls back to a plain GET only if the POST raises an exception.
+      Attempt 2 — reportFilters  (no filterType field)
+        Adds explicit greaterOrEqual / lessOrEqual filters for CLOSE_DATE.
+        Salesforce merges these with the report's existing saved filters by
+        column: the saved Close Date filter is replaced by our range; all other
+        filters (Stage, Type, etc.) are preserved.
+        Handles CW ARR which uses a custom date filter, not a standard one.
+
+      GET fallback — used only if both POSTs raise an exception.
+
+    Debug info is stored in st.session_state.sf_post_debug[report_id] so the
+    diagnostic expander can display exactly which path was taken and any errors.
     """
     params = {"includeDetails": "true"}
     result = None
+    debug  = []
+
+    if "sf_post_debug" not in st.session_state:
+        st.session_state.sf_post_debug = {}
 
     if start_date and end_date:
+
+        # ── Attempt 1: standardDateFilter ────────────────────────────────────
         try:
-            body = json.dumps({
+            body1 = json.dumps({
                 "reportMetadata": {
-                    # Mechanism 1 – override standard date filter
                     "standardDateFilter": {
                         "column":        "CLOSE_DATE",
                         "durationValue": "CUSTOM",
                         "startDate":     start_date,
                         "endDate":       end_date,
-                    },
-                    # Mechanism 2 – append explicit range filters (appended,
-                    # not replacing; preserves Stage/Type/other saved filters)
-                    "reportFilters": [
-                        {
-                            "column":     "CLOSE_DATE",
-                            "filterType": "custom",
-                            "operator":   "greaterOrEqual",
-                            "value":      start_date,
-                        },
-                        {
-                            "column":     "CLOSE_DATE",
-                            "filterType": "custom",
-                            "operator":   "lessOrEqual",
-                            "value":      end_date,
-                        },
-                    ],
+                    }
                 }
             })
-            result = sf.restful(
+            r1 = sf.restful(
                 path=f"analytics/reports/{report_id}",
                 method="POST",
-                data=body,
+                data=body1,
                 params=params,
             )
-        except Exception:
-            result = None   # fall through to GET
+            n1 = len(r1.get("factMap", {}).get("T!T", {}).get("rows", []))
+            if n1 < 2000:
+                result = r1
+                debug.append(f"Attempt1(stdDateFilter) OK → {n1} rows")
+            else:
+                debug.append(f"Attempt1(stdDateFilter) returned {n1} rows (cap hit — filter ignored, trying Attempt2)")
+        except Exception as e1:
+            debug.append(f"Attempt1(stdDateFilter) EXCEPTION: {e1}")
 
+        # ── Attempt 2: reportFilters (no filterType) ─────────────────────────
+        if result is None:
+            try:
+                body2 = json.dumps({
+                    "reportMetadata": {
+                        "reportFilters": [
+                            {
+                                "column":   "CLOSE_DATE",
+                                "operator": "greaterOrEqual",
+                                "value":    start_date,
+                            },
+                            {
+                                "column":   "CLOSE_DATE",
+                                "operator": "lessOrEqual",
+                                "value":    end_date,
+                            },
+                        ]
+                    }
+                })
+                r2 = sf.restful(
+                    path=f"analytics/reports/{report_id}",
+                    method="POST",
+                    data=body2,
+                    params=params,
+                )
+                n2 = len(r2.get("factMap", {}).get("T!T", {}).get("rows", []))
+                result = r2
+                debug.append(f"Attempt2(reportFilters) OK → {n2} rows")
+            except Exception as e2:
+                debug.append(f"Attempt2(reportFilters) EXCEPTION: {e2}")
+
+    # ── GET fallback ──────────────────────────────────────────────────────────
     if result is None:
         result = sf.restful(
             path=f"analytics/reports/{report_id}",
             method="GET",
             params=params,
         )
+        nG = len(result.get("factMap", {}).get("T!T", {}).get("rows", []))
+        debug.append(f"GET fallback → {nG} rows")
+
+    st.session_state.sf_post_debug[report_id] = " | ".join(debug)
 
     meta   = result.get("reportMetadata", {})
     ext    = result.get("reportExtendedMetadata", {})
@@ -850,6 +889,21 @@ st.markdown("<br>", unsafe_allow_html=True)
 
 # ── Data Diagnostic (persistent expander in main area) ────────────────────────
 with st.expander("Report Data Diagnostic — expand to inspect raw data", expanded=False):
+    # ── POST attempt trace (shows exactly which path was taken per report) ───
+    _dbg = st.session_state.get("sf_post_debug", {})
+    if _dbg:
+        st.markdown("**POST Attempt Log**")
+        _rpt_ids = {
+            st.secrets.get("reports", {}).get("cw_arr_report_id",  "—"): "CW ARR",
+            st.secrets.get("reports", {}).get("ltc_report_id",     "—"): "LTC",
+            st.secrets.get("reports", {}).get("retention_report_id","—"): "Retention",
+            st.secrets.get("reports", {}).get("complete_report_id", "—"): "Complete",
+        }
+        for _rid, _trace in _dbg.items():
+            _name = _rpt_ids.get(_rid, _rid)
+            st.caption(f"{_name}: {_trace}")
+        st.markdown("---")
+
     for _lbl, _raw, _dcol in [
         ("CW ARR",    st.session_state.raw_cw,   "Close Date"),
         ("LTC",       st.session_state.raw_ltc,  "Close Date"),
