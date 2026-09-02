@@ -643,17 +643,15 @@ with st.sidebar:
                             f"that is excluding data. Open each report in Salesforce, remove "
                             f"or widen any Close Date / Date filters, save the report, "
                             f"then click Run Reports again.")
-
-                    # ── Column preview (helps catch naming mismatches) ────────
-                    with st.expander("Report column preview (click to inspect)"):
-                        for label, df in [("CW ARR", cw_df),("LTC", ltc_df),
-                                          ("Retention", ret_df),("Complete", comp_df)]:
-                            st.markdown(f"**{label}** — {len(df)} rows")
-                            if len(df) > 0:
-                                st.write(list(df.columns))
-                                st.dataframe(df.head(2), use_container_width=True)
-                            else:
-                                st.caption("No rows returned.")
+                    # ── API row cap warning ───────────────────────────────────
+                    capped = [name for name, n in
+                              [("CW ARR", n1),("LTC", n2),("Retention", n3),("Complete", n4)]
+                              if n >= 2000]
+                    if capped:
+                        st.warning(
+                            f"**{', '.join(capped)} returned 2,000 rows** — the Salesforce "
+                            f"Analytics API cap. Some records may be missing. Consider narrowing "
+                            f"the report's date filter.")
 
                 except Exception as e:
                     st.error(f"Report error: {e}")
@@ -770,6 +768,26 @@ k5.markdown(kpi_html("Reps ≥ 100%",      f"{org['Above_100']}/{org['Total_Reps
 k6.markdown(kpi_html("Reps ≥ 120%",      f"{org['Above_120']}/{org['Total_Reps']}", "green"), unsafe_allow_html=True)
 
 st.markdown("<br>", unsafe_allow_html=True)
+
+# ── Data Diagnostic (persistent expander in main area) ────────────────────────
+with st.expander("Report Data Diagnostic — expand to inspect raw data", expanded=False):
+    for _lbl, _raw, _dcol in [
+        ("CW ARR",    st.session_state.raw_cw,   "Close Date"),
+        ("LTC",       st.session_state.raw_ltc,  "Close Date"),
+        ("Retention", st.session_state.raw_ret,  "Final Month Closed"),
+        ("Complete",  st.session_state.raw_comp, "Close Month"),
+    ]:
+        st.markdown(f"**{_lbl}** — {len(_raw)} rows from API")
+        st.caption(f"Columns: {list(_raw.columns)}")
+        if _dcol in _raw.columns and len(_raw) > 0:
+            _sample = _raw[_dcol].dropna().head(3).tolist()
+            st.caption(f"'{_dcol}' sample values: {_sample}")
+            _parsed = pd.to_datetime(_raw[_dcol], errors="coerce")
+            _dist   = _parsed.dt.to_period("M").value_counts().sort_index()
+            st.caption(f"Date distribution (year-month: count): {_dist.to_dict()}")
+        elif _dcol not in _raw.columns:
+            st.warning(f"Column '{_dcol}' NOT FOUND in report. Available: {list(_raw.columns)}")
+        st.markdown("---")
 
 # ── Row 2: Segment chart + Component donut ─────────────────────────────────
 col_seg, col_donut = st.columns([3, 2])
