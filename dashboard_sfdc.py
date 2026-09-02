@@ -190,45 +190,49 @@ def _cell_val(cell):
 # ─────────────────────────────────────────────────────────────────────────────
 # QUOTA LOADING
 # ─────────────────────────────────────────────────────────────────────────────
-def load_quotas(tgt_bytes, month_num):
+QUARTER_OF = {1:("Q1",0),2:("Q1",1),3:("Q1",2),
+              4:("Q2",0),5:("Q2",1),6:("Q2",2),
+              7:("Q3",0),8:("Q3",1),9:("Q3",2),
+              10:("Q4",0),11:("Q4",1),12:("Q4",2)}
+QLIN_COL   = {"Q1":2,"Q2":3,"Q3":4,"Q4":5}
+MLIN_COL   = {0:6, 1:7, 2:8}
+
+def load_quotas(tgt_bytes, month_nums):
     """Return (ldr_quota_map, rep_quota_map, rep_leader_map, rep_team_map,
-               seg_pl_map, monthly_factor)"""
+               seg_pl_map, monthly_factor).
+    month_nums: int or list of ints — quotas are summed across all months."""
+    if isinstance(month_nums, int):
+        month_nums = [month_nums]
     buf = io.BytesIO(tgt_bytes)
 
     # ── Leader Quotas with Linearity sheet ──────────────────────────────────
     ldr_raw = pd.read_excel(buf, sheet_name="Leader Quotas with Linearity", header=None)
-    q3_lin  = float(ldr_raw.iloc[1, 4])   # Q3 linearity (fraction of annual)
-    m1_lin  = float(ldr_raw.iloc[1, 6])   # M1 within-quarter linearity
 
-    # Determine quarter / M position
-    QUARTER_OF = {1:("Q1",0),2:("Q1",1),3:("Q1",2),
-                  4:("Q2",0),5:("Q2",1),6:("Q2",2),
-                  7:("Q3",0),8:("Q3",1),9:("Q3",2),
-                  10:("Q4",0),11:("Q4",1),12:("Q4",2)}
-    QLIN_COL   = {"Q1":2,"Q2":3,"Q3":4,"Q4":5}
-    MLIN_COL   = {0:6, 1:7, 2:8}
+    # Sum monthly_factor across all months in the period
+    monthly_factor = sum(
+        float(ldr_raw.iloc[1, QLIN_COL[QUARTER_OF[m][0]]]) *
+        float(ldr_raw.iloc[1, MLIN_COL[QUARTER_OF[m][1]]])
+        for m in month_nums
+    )
 
-    q_label, m_pos = QUARTER_OF[month_num]
-    q_lin = float(ldr_raw.iloc[1, QLIN_COL[q_label]])
-    m_lin = float(ldr_raw.iloc[1, MLIN_COL[m_pos]])
-    monthly_factor = q_lin * m_lin
-
-    # Leader monthly quota column (col 7=Jan…18=Dec)
-    month_col = 6 + month_num
-
+    # Leader quota: sum of monthly quota columns for each month (col 7=Jan … 18=Dec)
     leader_quota_map = {}
     for _, row in ldr_raw.iloc[5:24].iterrows():
         name = normalize(str(row.iloc[1]).strip()) if not pd.isna(row.iloc[1]) else ""
-        try:   q = float(row.iloc[month_col])
+        try:
+            q = sum(float(row.iloc[6 + m]) for m in month_nums
+                    if not pd.isna(row.iloc[6 + m]))
         except: q = 0.0
         if name and name not in ("nan",""):
             leader_quota_map[name] = q
 
-    # P&L rows (VP + Tim Downs total)
+    # P&L rows (VP + Tim Downs total) — sum across months
     pl_by_name = {}
     for _, row in ldr_raw.iloc[31:35].iterrows():
         name = normalize(str(row.iloc[1]).strip()) if not pd.isna(row.iloc[1]) else ""
-        try:   q = float(row.iloc[month_col])
+        try:
+            q = sum(float(row.iloc[6 + m]) for m in month_nums
+                    if not pd.isna(row.iloc[6 + m]))
         except: q = 0.0
         if name: pl_by_name[name] = q
 
@@ -262,29 +266,30 @@ def load_quotas(tgt_bytes, month_num):
 # ─────────────────────────────────────────────────────────────────────────────
 def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
              ldr_quota_map, rep_quota_map, rep_leader_map, rep_team_map,
-             seg_pl, month_num, year, monthly_factor=0.066687):
-    month_name = MONTH_NAMES[month_num - 1]
+             seg_pl, month_nums, year, monthly_factor=0.066687):
+    if isinstance(month_nums, int):
+        month_nums = [month_nums]
+    month_names = [MONTH_NAMES[m - 1] for m in month_nums]
 
-    # ── Filter by month ──────────────────────────────────────────────────────
+    # ── Filter by period ─────────────────────────────────────────────────────
     cw = cw_raw.copy()
     cw["Close Date"] = pd.to_datetime(cw["Close Date"], errors="coerce")
-    cw = cw[(cw["Close Date"].dt.month == month_num) &
+    cw = cw[(cw["Close Date"].dt.month.isin(month_nums)) &
             (cw["Close Date"].dt.year  == year)].copy()
     cw["Opportunity Owner"] = cw["Opportunity Owner"].apply(normalize)
-    # Support both the standard SFDC field and the custom hardcoded field
     mgr_col_cw = "Oppty Manager" if "Oppty Manager" in cw.columns else "Opportunity Owner: Manager"
     cw[mgr_col_cw] = cw[mgr_col_cw].apply(normalize)
 
     ltc = ltc_raw.copy()
     ltc["Close Date"] = pd.to_datetime(ltc["Close Date"], errors="coerce")
-    ltc = ltc[(ltc["Close Date"].dt.month == month_num) &
+    ltc = ltc[(ltc["Close Date"].dt.month.isin(month_nums)) &
               (ltc["Close Date"].dt.year  == year)].copy()
     ltc["Opportunity Owner"] = ltc["Opportunity Owner"].apply(normalize)
     mgr_col_ltc = "Oppty Manager" if "Oppty Manager" in ltc.columns else "Opportunity Owner: Manager"
     ltc[mgr_col_ltc] = ltc[mgr_col_ltc].apply(normalize)
 
     ret = ret_raw.copy()
-    ret = ret[ret["Final Month Closed"] == month_name].copy()
+    ret = ret[ret["Final Month Closed"].isin(month_names)].copy()
     ret["Opportunity Owner"] = ret["Opportunity Owner"].apply(normalize)
     mgr_col_ret = "Oppty Manager" if "Oppty Manager" in ret.columns else "Opportunity Owner: Manager"
     ret[mgr_col_ret] = ret[mgr_col_ret].apply(normalize)
@@ -297,7 +302,7 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
 
     comp = comp_raw.copy()
     comp["Close Month"] = pd.to_datetime(comp["Close Month"], errors="coerce")
-    comp = comp[(comp["Close Month"].dt.month == month_num) &
+    comp = comp[(comp["Close Month"].dt.month.isin(month_nums)) &
                 (comp["Close Month"].dt.year  == year)].copy()
     comp["Opportunity Owner"] = comp["Opportunity Owner"].apply(normalize)
     comp["Complete_Credit_Val"] = pd.to_numeric(
@@ -326,6 +331,7 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
     master = cw.copy()
     master["Rep"]    = master["Opportunity Owner"]          # normalized above
     master["Leader"] = master[mgr_col_cw]                  # normalized above
+    master["Region"] = master["Oppty Team"] if "Oppty Team" in master.columns else "Unknown"
     master["Segment"]= master["Oppty Team"].apply(seg_from_team)
     master["VP"]     = master["Segment"].map(VP_MAP).fillna("N/A")
     master["Forecast_Amount_ARR"] = pd.to_numeric(master["Forecast Amount"], errors="coerce").fillna(0)
@@ -346,6 +352,7 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
     # ── Rep aggregation ──────────────────────────────────────────────────────
     cw_by_rep = master.groupby("Rep").agg(
         Leader_cw       = ("Leader",          "first"),
+        Region_cw       = ("Region",          "first"),
         Segment_cw      = ("Segment",         "first"),
         VP              = ("VP",              "first"),
         CW_ARR          = ("CW_ARR_Adjusted", "sum"),
@@ -377,7 +384,14 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
                 return src
         return seg_from_team(rep_team_map.get(row["Rep"], ""))
 
+    def resolve_region(row):
+        for src in [row.get("Region_cw",""), row.get("Team_ret","")]:
+            if isinstance(src, str) and src.strip() not in ("","nan","Unknown","NaN"):
+                return src.strip()
+        return rep_team_map.get(row["Rep"], "Unknown")
+
     rep_grp["Leader"]  = rep_grp.apply(resolve_leader, axis=1)
+    rep_grp["Region"]  = rep_grp.apply(resolve_region, axis=1)
     rep_grp["Segment"] = rep_grp.apply(resolve_segment, axis=1)
     rep_grp["VP"]      = rep_grp["Segment"].map(VP_MAP).fillna("N/A")
     rep_grp["Total_Credited"] = (rep_grp["CW_ARR"] + rep_grp["LTC_Credit"]
@@ -387,13 +401,14 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
     rep_grp["Pct_to_Linearity"] = np.where(
         rep_grp["Monthly_Quota"] > 0,
         rep_grp["Total_Credited"] / rep_grp["Monthly_Quota"], np.nan)
-    rep_grp = rep_grp[["Rep","Leader","Segment","VP",
+    rep_grp = rep_grp[["Rep","Leader","Region","Segment","VP",
                         "CW_ARR","LTC_Credit","Retention_Credit","Complete_Credit",
                         "Total_Credited","Monthly_Quota","Pct_to_Linearity","CW_Units"]]
 
     # ── Leader aggregation ───────────────────────────────────────────────────
     ldr_grp = rep_grp.groupby("Leader").agg(
         Segment         = ("Segment",          "first"),
+        Region          = ("Region",           "first"),
         VP              = ("VP",               "first"),
         CW_ARR          = ("CW_ARR",           "sum"),
         LTC_Credit      = ("LTC_Credit",       "sum"),
@@ -462,6 +477,10 @@ for k, v in [("sf", None), ("data", None), ("last_run", None),
               ("tgt_bytes", None), ("monthly_factor", None)]:
     if k not in st.session_state:
         st.session_state[k] = v
+
+# period_label / sel_region defaults (overwritten by sidebar widgets each run)
+period_label = "—"
+sel_region   = "All Regions"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SIDEBAR
@@ -546,14 +565,28 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # ── Month / Year ──────────────────────────────────────────────────────────
+    # ── Reporting Period ──────────────────────────────────────────────────────
     st.markdown("**Reporting Period**")
-    col_m, col_y = st.columns(2)
-    sel_month = col_m.selectbox("Month", MONTH_NAMES,
-                                 index=MONTH_NAMES.index("July"))
-    sel_year  = col_y.number_input("Year", min_value=2020, max_value=2030,
-                                    value=2026, step=1)
-    month_num = MONTH_NAMES.index(sel_month) + 1
+    period_type = st.radio("Period Type", ["Monthly", "Quarterly", "YTD"],
+                           horizontal=True)
+    sel_year = st.number_input("Year", min_value=2020, max_value=2030,
+                                value=2026, step=1)
+    QUARTER_MONTHS = {"Q1":[1,2,3],"Q2":[4,5,6],"Q3":[7,8,9],"Q4":[10,11,12]}
+
+    if period_type == "Monthly":
+        sel_month = st.selectbox("Month", MONTH_NAMES,
+                                  index=MONTH_NAMES.index("July"))
+        month_nums    = [MONTH_NAMES.index(sel_month) + 1]
+        period_label  = f"{sel_month} {int(sel_year)}"
+    elif period_type == "Quarterly":
+        sel_quarter = st.selectbox("Quarter", ["Q1","Q2","Q3","Q4"], index=2)
+        month_nums   = QUARTER_MONTHS[sel_quarter]
+        period_label = f"{sel_quarter} {int(sel_year)}"
+    else:  # YTD
+        sel_month = st.selectbox("Through Month", MONTH_NAMES,
+                                  index=MONTH_NAMES.index("July"))
+        month_nums   = list(range(1, MONTH_NAMES.index(sel_month) + 2))
+        period_label = f"YTD through {sel_month} {int(sel_year)}"
 
     st.markdown("---")
 
@@ -622,12 +655,12 @@ with st.sidebar:
             with st.spinner("Calculating metrics…"):
                 try:
                     lq, rq, rlm, rtm, sp, mf = load_quotas(
-                        st.session_state.tgt_bytes, month_num)
+                        st.session_state.tgt_bytes, month_nums)
                     st.session_state.monthly_factor = mf
                     result = run_calc(
                         st.session_state.raw_cw,  st.session_state.raw_ltc,
                         st.session_state.raw_ret, st.session_state.raw_comp,
-                        lq, rq, rlm, rtm, sp, month_num, int(sel_year),
+                        lq, rq, rlm, rtm, sp, month_nums, int(sel_year),
                         monthly_factor=mf)
                     st.session_state.data     = result
                     st.session_state.last_run = datetime.now()
@@ -641,19 +674,26 @@ with st.sidebar:
     if st.session_state.data:
         st.markdown("---")
         st.markdown("**Filters**")
-        ldr_df_all = st.session_state.data["leader"]
+        rep_df_all  = st.session_state.data["rep"]
+        ldr_df_all  = st.session_state.data["leader"]
+
         segs_avail = ["All Segments"] + sorted(
-            ldr_df_all[ldr_df_all["Segment"].isin(["Key","Premier","Strategic"])]["Segment"].unique())
+            rep_df_all[rep_df_all["Segment"].isin(["Key","Premier","Strategic"])]["Segment"].unique())
         sel_seg = st.selectbox("Segment", segs_avail)
-        if sel_seg == "All Segments":
-            ldrs_avail = ["All Leaders"] + sorted(ldr_df_all["Leader"].dropna().unique().tolist())
-        else:
-            ldrs_avail = ["All Leaders"] + sorted(
-                ldr_df_all[ldr_df_all["Segment"]==sel_seg]["Leader"].dropna().unique().tolist())
+
+        _rep_seg = rep_df_all[rep_df_all["Segment"]==sel_seg] if sel_seg != "All Segments" else rep_df_all
+        regions_avail = ["All Regions"] + sorted(
+            _rep_seg["Region"].dropna().replace("Unknown","").str.strip()
+            .loc[lambda s: s != ""].unique().tolist())
+        sel_region = st.selectbox("Region", regions_avail)
+
+        _rep_reg = _rep_seg[_rep_seg["Region"]==sel_region] if sel_region != "All Regions" else _rep_seg
+        ldrs_avail = ["All Leaders"] + sorted(_rep_reg["Leader"].dropna().unique().tolist())
         sel_ldr = st.selectbox("Leader", ldrs_avail)
     else:
-        sel_seg = "All Segments"
-        sel_ldr = "All Leaders"
+        sel_seg    = "All Segments"
+        sel_region = "All Regions"
+        sel_ldr    = "All Leaders"
 
     if st.session_state.last_run:
         st.caption(f"Last run: {st.session_state.last_run.strftime('%b %d %Y %H:%M')}")
@@ -686,19 +726,25 @@ rep_df  = data["rep"].copy()
 dist_df = data["dist"].copy()
 
 # Apply filters
-ldr_filtered = ldr_df[ldr_df["Segment"]==sel_seg] if sel_seg!="All Segments" else ldr_df
+ldr_filtered = ldr_df.copy()
 rep_filtered = rep_df.copy()
 if sel_seg != "All Segments":
+    ldr_filtered = ldr_filtered[ldr_filtered["Segment"]==sel_seg]
     rep_filtered = rep_filtered[rep_filtered["Segment"]==sel_seg]
+if sel_region != "All Regions":
+    rep_filtered = rep_filtered[rep_filtered["Region"]==sel_region]
+    leaders_in_region = rep_filtered["Leader"].unique()
+    ldr_filtered = ldr_filtered[ldr_filtered["Leader"].isin(leaders_in_region)]
 if sel_ldr != "All Leaders":
     rep_filtered = rep_filtered[rep_filtered["Leader"]==sel_ldr]
+    ldr_filtered = ldr_filtered[ldr_filtered["Leader"]==sel_ldr]
 
 # ── Header ────────────────────────────────────────────────────────────────────
 st.markdown(
     f"<div style='font-size:21px;font-weight:700;color:{C['dark_blue']};"
     f"border-bottom:3px solid {C['blue']};padding-bottom:7px;margin-bottom:18px'>"
     f"SAP Concur &nbsp;|&nbsp; US SMB Client Sales &nbsp;|&nbsp; "
-    f"{sel_month} {int(sel_year)} Performance Recap"
+    f"{period_label} Performance Recap"
     f"</div>",
     unsafe_allow_html=True)
 
@@ -752,7 +798,10 @@ with col_seg:
 
 with col_donut:
     st.markdown("<div class='sh'>Credit Components</div>", unsafe_allow_html=True)
-    comp_vals   = [org["CW_ARR"], org["LTC_Credit"], org["Retention_Credit"], org["Complete_Credit"]]
+    # Use filtered rep data so the donut updates when segment/region/leader filters are applied
+    tc_f        = rep_filtered["Total_Credited"].sum()
+    comp_vals   = [rep_filtered["CW_ARR"].sum(), rep_filtered["LTC_Credit"].sum(),
+                   rep_filtered["Retention_Credit"].sum(), rep_filtered["Complete_Credit"].sum()]
     comp_labels = ["CW ARR", "LTC Uplift", "Retention", "Complete"]
     comp_colors = [C["blue"], C["light_blue"], "#5DB533", C["amber"]]
     fig_d = go.Figure(go.Pie(
@@ -761,7 +810,7 @@ with col_donut:
         textinfo="label+percent", textfont=dict(size=11),
         hovertemplate="%{label}: $%{value:,.0f}<extra></extra>",
     ))
-    fig_d.add_annotation(text=f"<b>{fmt_m(tc)}</b><br>Total",
+    fig_d.add_annotation(text=f"<b>{fmt_m(tc_f)}</b><br>Total",
                          x=0.5, y=0.5, showarrow=False,
                          font=dict(size=13, color=C["dark_blue"]))
     fig_d.update_layout(height=310, paper_bgcolor=C["bg"],
@@ -804,11 +853,12 @@ with col_ldr:
 
 with col_dist:
     st.markdown("<div class='sh'>Attainment Distribution</div>", unsafe_allow_html=True)
-    dp = dist_df[dist_df["Bucket"].isin(BUCKET_ORDER)].copy()
-    dp["Color"] = dp["Bucket"].map(BUCKET_COLORS).fillna(C["blue"])
-    # ensure all buckets present
+    # Recompute distribution from filtered reps so it updates with segment/region/leader filters
+    dist_f = rep_filtered[rep_filtered["Monthly_Quota"] > 0].copy()
+    dist_f["Bucket"] = dist_f["Pct_to_Linearity"].apply(bucket)
+    dp_raw = dist_f.groupby("Bucket").size().reset_index(name="Count")
     all_b = pd.DataFrame({"Bucket": BUCKET_ORDER})
-    dp = all_b.merge(dp, on="Bucket", how="left").fillna(0)
+    dp = all_b.merge(dp_raw, on="Bucket", how="left").fillna(0)
     dp["Color"] = dp["Bucket"].map(BUCKET_COLORS)
     fig_dist = go.Figure(go.Bar(
         x=dp["Count"], y=dp["Bucket"], orientation="h",
@@ -827,7 +877,7 @@ with col_dist:
 
 # ── Row 4: Rep table ───────────────────────────────────────────────────────
 st.markdown("<div class='sh'>Rep Performance Detail</div>", unsafe_allow_html=True)
-rt = rep_filtered[["Rep","Leader","Segment","Monthly_Quota","CW_ARR","LTC_Credit",
+rt = rep_filtered[["Rep","Leader","Region","Segment","Monthly_Quota","CW_ARR","LTC_Credit",
                     "Retention_Credit","Complete_Credit","Total_Credited",
                     "Pct_to_Linearity","CW_Units"]].copy()
 rt["Pct_to_Linearity"] = (rt["Pct_to_Linearity"] * 100).round(1)
@@ -865,7 +915,7 @@ row_counts = org.get("Row_Counts", {})
 rc_str = " | ".join(f"{k}: {v} rows" for k,v in row_counts.items())
 st.markdown(
     f"<div style='text-align:center;color:{C['dark_grey']};font-size:11px;margin-top:16px'>"
-    f"SAP Concur US SMB Client Sales &nbsp;|&nbsp; {sel_month} {int(sel_year)} &nbsp;|&nbsp; "
+    f"SAP Concur US SMB Client Sales &nbsp;|&nbsp; {period_label} &nbsp;|&nbsp; "
     f"Source: Salesforce Reports &nbsp;|&nbsp; {rc_str}"
     f"</div>",
     unsafe_allow_html=True)
