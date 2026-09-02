@@ -144,11 +144,19 @@ def sf_connect_session(session_id, instance_url="https://sapconcur.my.salesforce
 def sf_run_report(sf, report_id, start_date=None, end_date=None):
     """Run a Salesforce Analytics report and return (DataFrame, row_count).
 
-    If start_date / end_date (YYYY-MM-DD strings) are supplied the function
-    attempts a POST to override the report's standard date filter to that exact
-    range.  This keeps results well under the 2,000-row API cap regardless of
-    how the report is configured in Salesforce.  Falls back to a plain GET if
-    the POST is rejected for any reason.
+    When start_date / end_date are supplied the function POSTs with TWO
+    independent date-scoping mechanisms so the range is honoured regardless of
+    how each individual report is configured in Salesforce:
+
+      1. standardDateFilter override  – works when the report uses the built-in
+         'standard' date filter (e.g. LTC, Complete).
+      2. reportFilters addition       – works for reports that use a custom
+         date filter instead of the standard one (e.g. CW ARR).  The Salesforce
+         Analytics API *appends* reportFilters to the report's existing saved
+         filters rather than replacing them, so Stage / Type / other criteria
+         are always preserved.
+
+    Falls back to a plain GET only if the POST raises an exception.
     """
     params = {"includeDetails": "true"}
     result = None
@@ -157,12 +165,29 @@ def sf_run_report(sf, report_id, start_date=None, end_date=None):
         try:
             body = json.dumps({
                 "reportMetadata": {
+                    # Mechanism 1 – override standard date filter
                     "standardDateFilter": {
                         "column":        "CLOSE_DATE",
                         "durationValue": "CUSTOM",
                         "startDate":     start_date,
                         "endDate":       end_date,
-                    }
+                    },
+                    # Mechanism 2 – append explicit range filters (appended,
+                    # not replacing; preserves Stage/Type/other saved filters)
+                    "reportFilters": [
+                        {
+                            "column":     "CLOSE_DATE",
+                            "filterType": "custom",
+                            "operator":   "greaterOrEqual",
+                            "value":      start_date,
+                        },
+                        {
+                            "column":     "CLOSE_DATE",
+                            "filterType": "custom",
+                            "operator":   "lessOrEqual",
+                            "value":      end_date,
+                        },
+                    ],
                 }
             })
             result = sf.restful(
