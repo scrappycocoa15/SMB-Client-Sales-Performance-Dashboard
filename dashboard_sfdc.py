@@ -689,9 +689,10 @@ with st.sidebar:
         sel_seg = st.selectbox("Segment", segs_avail)
 
         _rep_seg = rep_df_all[rep_df_all["Segment"]==sel_seg] if sel_seg != "All Segments" else rep_df_all
-        regions_avail = ["All Regions"] + sorted(
-            _rep_seg["Region"].dropna().replace("Unknown","").str.strip()
-            .loc[lambda s: s != ""].unique().tolist())
+        regions_avail = ["All Regions"] + sorted([
+            r for r in _rep_seg["Region"].unique()
+            if isinstance(r, str) and r.strip() not in ("", "Unknown", "nan")
+        ])
         sel_region = st.selectbox("Region", regions_avail)
 
         _rep_reg = _rep_seg[_rep_seg["Region"]==sel_region] if sel_region != "All Regions" else _rep_seg
