@@ -639,7 +639,26 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
     ltc[mgr_col_ltc] = ltc[mgr_col_ltc].apply(normalize)
 
     ret = ret_raw.copy()
-    ret = ret[ret["Final Month Closed"].isin(month_names)].copy()
+    # ── Year-aware Final Month Closed filter ─────────────────────────────────
+    # The Retention SFDC report often has no standard date field (Final Month
+    # Closed is a text picklist), so the API may return ALL-TIME records.
+    # The field stores just the month name ("June", no year) on some orgs.
+    # Without a year check, isin(["June"]) would match June 2025 AND June 2026,
+    # inflating retention by ~$300k.  We accept three formats:
+    #   1. "June 2026"  — explicit month-year (most reliable)
+    #   2. "June"       — month only, validated against Close Date year
+    #   3. "Jun 2026" / "Jun-2026" — short-month variants
+    _fmc = ret["Final Month Closed"].fillna("").astype(str).str.strip()
+    _month_year_explicit = [f"{mn} {year}" for mn in month_names]          # ["June 2026"]
+    _month_year_short    = [f"{mn[:3]} {year}" for mn in month_names]       # ["Jun 2026"]
+    _month_year_hyphen   = [f"{mn[:3]}-{year}" for mn in month_names]       # ["Jun-2026"]
+    _month_only          = month_names                                        # ["June"]
+    # For month-only values, cross-validate against Close Date year
+    _close_yr = pd.to_datetime(ret.get("Close Date", pd.Series(dtype=str)),
+                               errors="coerce").dt.year
+    _match_explicit = _fmc.isin(_month_year_explicit + _month_year_short + _month_year_hyphen)
+    _match_month_only = _fmc.isin(_month_only) & _close_yr.eq(year).fillna(False)
+    ret = ret[_match_explicit | _match_month_only].copy()
     ret["Opportunity Owner"] = ret["Opportunity Owner"].apply(normalize)
     mgr_col_ret = "Oppty Manager" if "Oppty Manager" in ret.columns else "Opportunity Owner: Manager"
     ret[mgr_col_ret] = ret[mgr_col_ret].apply(normalize)
@@ -651,9 +670,23 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
     ret = ret[~split_mask].copy()
 
     comp = comp_raw.copy()
-    comp["Close Month"] = pd.to_datetime(comp["Close Month"], errors="coerce")
-    comp = comp[(comp["Close Month"].dt.month.isin(month_nums)) &
-                (comp["Close Month"].dt.year  == year)].copy()
+    # ── Year-aware Close Month filter ────────────────────────────────────────
+    # Close Month may be a text formula ("June 2026", "Jun-25", "6/1/2026").
+    # pd.to_datetime can silently misparse "Jun-25" as June 25 current year,
+    # making dt.year == 2026 pass for a 2025 deal.  We layer two checks:
+    #   1. dt.year == year  AND  dt.month in month_nums  (parsed date)
+    #   2. raw string contains str(year) AND month name/number  (belt-and-suspenders)
+    _cm_raw = comp["Close Month"].astype(str).str.strip()
+    comp["_cm_parsed"] = pd.to_datetime(_cm_raw, errors="coerce", dayfirst=False)
+    # String-level year check: the raw cell must mention the target year
+    _str_year_ok   = _cm_raw.str.contains(str(year), na=False)
+    _str_month_ok  = _cm_raw.str.contains(
+        "|".join([str(m) for m in month_nums] + month_names + [mn[:3] for mn in month_names]),
+        case=False, na=False)
+    _date_ok = (comp["_cm_parsed"].dt.year == year) & \
+               (comp["_cm_parsed"].dt.month.isin(month_nums))
+    comp = comp[_date_ok & _str_year_ok | (_str_year_ok & _str_month_ok)].copy()
+    comp.drop(columns=["_cm_parsed"], inplace=True)
     comp["Opportunity Owner"] = comp["Opportunity Owner"].apply(normalize)
     comp["Complete_Credit_Val"] = pd.to_numeric(
         comp["Roll-up Sales Credit Calculation (converted)"], errors="coerce").fillna(0)
