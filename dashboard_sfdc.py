@@ -97,6 +97,64 @@ def normalize(name):
     s = str(name).strip()
     return NAME_MAP.get(s, s)
 
+
+def build_region_leader_map(cw_df):
+    """Derive a live Region → Leader map from the CW ARR dataset.
+
+    For each Owner Region, finds the most recent calendar month that has
+    deals and takes the most common 'Opportunity Owner: Manager' in that
+    month as the authoritative current leader for that region.
+
+    WHY this works for mid-year transfers:
+      - A deal's Owner Region is stamped at close time and never changes.
+      - The reps closing deals in a region RIGHT NOW are its current
+        members, so their current manager IS the current regional leader.
+      - Historical deals from reps who have since moved still carry their
+        original region, so they are attributed to whoever manages that
+        region today — which is exactly the desired behaviour.
+
+    Priority in run_calc:
+      1. region_leader_map[Owner Region]   ← this function
+      2. Opportunity Owner: Manager         ← SFDC hierarchy (fallback)
+      3. rep_leader_map from targets file   ← start-of-year snapshot (last resort)
+    """
+    df = cw_df.copy()
+    df["_dt"] = pd.to_datetime(df.get("Close Date"), errors="coerce")
+
+    # Prefer 'Oppty Manager' if the bucket field is still present, otherwise
+    # use the standard SFDC manager hierarchy column
+    mgr_col = ("Oppty Manager" if "Oppty Manager" in df.columns
+               else "Opportunity Owner: Manager")
+
+    # Use "Oppty Region" (stable — tied to the opportunity, never changes when
+    # the owner transfers).  Fall back to "Oppty Team" if Oppty Region is absent.
+    region_col = ("Oppty Region" if "Oppty Region" in df.columns
+                  else "Owner Region" if "Owner Region" in df.columns
+                  else None)
+
+    if mgr_col not in df.columns or region_col is None:
+        return {}
+
+    df = df.dropna(subset=[region_col, "_dt", mgr_col])
+    df["_mgr"]    = df[mgr_col].apply(normalize)
+    df["_region"] = df[region_col].str.strip()
+    df["_period"] = df["_dt"].dt.to_period("M")
+
+    region_leader = {}
+    for region, grp in df.groupby("_region"):
+        if region in ("", "Unknown", "nan"):
+            continue
+        # Most recent month with ≥1 deal in this region
+        latest = grp["_period"].max()
+        recent = grp[grp["_period"] == latest]
+        # Most common manager in that month (mode handles multiple reps)
+        mode_vals = recent["_mgr"].dropna()
+        mode_vals = mode_vals[mode_vals.str.strip().ne("")]
+        if len(mode_vals) > 0:
+            region_leader[region] = mode_vals.mode().iloc[0]
+
+    return region_leader
+
 def seg_from_team(team):
     if isinstance(team, str):
         for s in ("Key","Premier","Strategic"):
@@ -211,30 +269,36 @@ def _sf_get_meta(sf, report_id):
 def sf_run_report(sf, report_id, start_date=None, end_date=None):
     """Run a Salesforce Analytics report and return (DataFrame, row_count).
 
-    Three sequential POST attempts using DIRECT requests.post() calls —
-    this bypasses simple_salesforce's restful(data=string) which can silently
-    drop the POST body in some library versions, causing Salesforce to run the
-    report with its default (full-year) filter instead of our date override.
+    Two POST attempts followed by a GET fallback.
 
-      Attempt 1 — standardDateFilter on CLOSE_DATE
-        Correct approach for any report whose Standard Date Filter is on
-        Close Date (LTC, Complete, Retention, and CW ARR if configured right).
+      Attempt 1 — minimal standardDateFilter on CLOSE_DATE
+        Fast path.  Works for LTC, Complete, Retention (no BucketFields).
+        Skipped immediately if the report contains a BucketField (HTTP 400).
         Accepted if response < 2,000 rows.
 
-      Attempt 2 — metadata-aware rebuild
-        Fetches the report's saved metadata to find the ACTUAL standard-date-
-        filter column (may not be CLOSE_DATE for all reports).  Preserves all
-        non-date reportFilters (Stage, Team, Type, etc.) and replaces only the
-        date scope.  Accepted if response < 2,000 rows.
+      Attempt 2 — FULL saved-metadata POST, date patched in-place  ← KEY FIX
+        Fetches the complete saved reportMetadata (including BucketField
+        definitions, bucketFields list, reportBooleanFilter, etc.) via GET,
+        deep-copies it, then patches ONLY the standardDateFilter and strips
+        any existing date entries from reportFilters.
 
-      Attempt 3 — reportFilters only, plain CLOSE_DATE (last resort)
-        Accepted regardless of row count; dedup in sf_run_report_multi handles
-        any lingering full-year duplicates.
+        WHY this is necessary:
+        The Salesforce Analytics API requires that any field present in the
+        report's saved metadata also be present in the POST body.  Reports
+        that contain Bucket Fields (custom grouping fields) fail with
+        HTTP 400 "Invalid value specified: BucketField_XXXXXXX" when a
+        minimal POST body is sent — because the BucketField definition is
+        missing.  By deep-copying the full saved metadata and only changing
+        the date, we preserve every required field and the POST succeeds.
 
-      GET fallback — only if all three POSTs throw an exception.
+        Accepted if response < 2,000 rows.
+
+      GET fallback — only if both POSTs throw an exception.
 
     All attempt results are logged to st.session_state.sf_post_debug.
     """
+    import copy as _copy
+
     params = {"includeDetails": "true"}
     result = None
     debug  = []
@@ -242,7 +306,7 @@ def sf_run_report(sf, report_id, start_date=None, end_date=None):
     if "sf_post_debug" not in st.session_state:
         st.session_state.sf_post_debug = {}
 
-    # Date-field API names to strip when rebuilding filters
+    # Date-field API names to strip when rebuilding reportFilters
     _DATE_COLS = {
         "CLOSE_DATE", "CLOSEDATE", "CLOSED_DATE",
         "CREATEDDATE", "LASTMODIFIEDDATE",
@@ -251,7 +315,8 @@ def sf_run_report(sf, report_id, start_date=None, end_date=None):
 
     if start_date and end_date:
 
-        # ── Attempt 1: standardDateFilter on CLOSE_DATE ───────────────────────
+        # ── Attempt 1: minimal standardDateFilter (fast path, no metadata call)
+        _a1_bucket_err = False
         try:
             r1 = _post_report(sf, report_id, {
                 "reportMetadata": {
@@ -268,64 +333,69 @@ def sf_run_report(sf, report_id, start_date=None, end_date=None):
                 result = r1
                 debug.append(f"A1(stdDateFilter/CLOSE_DATE) OK → {n1} rows")
             else:
-                debug.append(f"A1(stdDateFilter/CLOSE_DATE) → {n1} rows (2000-cap hit; trying A2)")
+                debug.append(
+                    f"A1(stdDateFilter/CLOSE_DATE) → {n1} rows "
+                    f"(2000-cap hit; trying full-meta A2)")
         except Exception as e1:
-            debug.append(f"A1 ERR: {e1}")
+            err_str = str(e1)
+            if "BucketField" in err_str:
+                _a1_bucket_err = True
+                debug.append(
+                    f"A1 ERR: BucketField in report — minimal POST rejected; "
+                    f"switching to full-metadata A2")
+            else:
+                debug.append(f"A1 ERR: {err_str}")
 
-        # ── Attempt 2: metadata-aware rebuild ────────────────────────────────
+        # ── Attempt 2: FULL saved-metadata POST, only date patched ───────────
+        # This is the only approach that works for reports containing Bucket
+        # Fields.  We deep-copy the entire saved reportMetadata so that the
+        # BucketField definition (and everything else) is preserved.
         if result is None:
             try:
-                full_meta      = _sf_get_meta(sf, report_id)
-                saved_meta     = full_meta.get("reportMetadata", {})
-                std_info       = saved_meta.get("standardDateFilter") or {}
-                std_col        = std_info.get("column", "CLOSE_DATE")
-                saved_filters  = saved_meta.get("reportFilters") or []
-                non_date       = [
-                    f for f in saved_filters
+                full_resp  = _sf_get_meta(sf, report_id)
+                saved_meta = full_resp.get("reportMetadata", {})
+                std_info   = saved_meta.get("standardDateFilter") or {}
+                std_col    = std_info.get("column", "CLOSE_DATE")
+
+                # Deep-copy full saved metadata — preserve BucketFields etc.
+                patched_meta = _copy.deepcopy(saved_meta)
+
+                # Patch only the date scope
+                patched_meta["standardDateFilter"] = {
+                    "column":        std_col,
+                    "durationValue": "CUSTOM",
+                    "startDate":     start_date,
+                    "endDate":       end_date,
+                }
+
+                # Strip existing date entries from reportFilters; add our range
+                existing_filters = patched_meta.get("reportFilters") or []
+                non_date = [
+                    f for f in existing_filters
                     if f.get("column", "").upper() not in _DATE_COLS
                 ]
-                new_filters    = non_date + [
-                    {"column": std_col, "operator": "greaterOrEqual", "value": start_date},
-                    {"column": std_col, "operator": "lessOrEqual",    "value": end_date},
+                patched_meta["reportFilters"] = non_date + [
+                    {"column": std_col, "operator": "greaterOrEqual",
+                     "value": start_date},
+                    {"column": std_col, "operator": "lessOrEqual",
+                     "value": end_date},
                 ]
-                r2 = _post_report(sf, report_id, {
-                    "reportMetadata": {
-                        "standardDateFilter": {
-                            "column":        std_col,
-                            "durationValue": "CUSTOM",
-                            "startDate":     start_date,
-                            "endDate":       end_date,
-                        },
-                        "reportFilters": new_filters,
-                    }
-                }, params)
+
+                r2 = _post_report(sf, report_id,
+                                  {"reportMetadata": patched_meta}, params)
                 n2 = len(r2.get("factMap", {}).get("T!T", {}).get("rows", []))
                 if n2 < 2000:
                     result = r2
-                    debug.append(f"A2(meta-rebuild/col={std_col}) OK → {n2} rows")
+                    debug.append(
+                        f"A2(full-meta/col={std_col}) OK → {n2} rows")
                 else:
-                    debug.append(f"A2(meta-rebuild/col={std_col}) → {n2} rows (still 2000-cap; trying A3)")
+                    debug.append(
+                        f"A2(full-meta/col={std_col}) → {n2} rows "
+                        f"(still 2000-cap — GET fallback will be used)")
             except Exception as e2:
                 debug.append(f"A2 ERR: {e2}")
 
-        # ── Attempt 3: plain reportFilters on CLOSE_DATE (last resort) ───────
-        if result is None:
-            try:
-                r3 = _post_report(sf, report_id, {
-                    "reportMetadata": {
-                        "reportFilters": [
-                            {"column": "CLOSE_DATE", "operator": "greaterOrEqual", "value": start_date},
-                            {"column": "CLOSE_DATE", "operator": "lessOrEqual",    "value": end_date},
-                        ]
-                    }
-                }, params)
-                n3 = len(r3.get("factMap", {}).get("T!T", {}).get("rows", []))
-                result = r3   # accept regardless — dedup handles duplicates
-                debug.append(f"A3(reportFilters/CLOSE_DATE) → {n3} rows (accepted; dedup active)")
-            except Exception as e3:
-                debug.append(f"A3 ERR: {e3}")
-
-    # ── GET fallback — only if all three POSTs threw exceptions ──────────────
+    # ── GET fallback — only if both POSTs threw exceptions ───────────────────
     if result is None:
         result = sf.restful(
             path=f"analytics/reports/{report_id}",
@@ -493,11 +563,60 @@ def load_quotas(tgt_bytes, month_nums):
     return leader_quota_map, rep_quota_map, rep_leader_map, rep_team_map, seg_pl, monthly_factor
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CALCULATION ENGINE  (ported from build_recap_july.py)
+# CALCULATION ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
+def _assign_leader(df, region_leader_map, mgr_col, rep_leader_map):
+    """Vectorized 4-level leader assignment for a deal-level DataFrame.
+
+    Priority (highest to lowest):
+      1. Oppty Region  → region_leader_map   (stable — tied to the opp)
+      2. Oppty Team    → region_leader_map   (fallback if Oppty Region absent)
+      3. mgr_col       → Opportunity Owner: Manager / Oppty Manager
+      4. rep_leader_map from targets file    (start-of-year snapshot)
+
+    By applying in reverse priority order (lowest first, higher overwrites),
+    each deal ends up with the most reliable leader available.
+    """
+    _bad = {"", "nan", "none", "unknown", "n/a"}
+
+    def _clean(s):
+        v = normalize(str(s)) if pd.notna(s) else ""
+        return "" if str(v).lower().strip() in _bad else str(v).strip()
+
+    # Base: targets file (lowest priority)
+    leader = df["Opportunity Owner"].apply(
+        lambda r: rep_leader_map.get(_clean(r), "Unknown"))
+
+    # Layer 3: SFDC manager hierarchy
+    if mgr_col in df.columns:
+        mgr = df[mgr_col].apply(_clean)
+        mask = mgr.ne("")
+        leader = leader.where(~mask, mgr)
+
+    if region_leader_map:
+        # Layer 2: Oppty Team → region_leader_map
+        if "Oppty Team" in df.columns:
+            team_ldr = df["Oppty Team"].apply(
+                lambda t: _clean(region_leader_map.get(str(t).strip(), "")))
+            mask = team_ldr.ne("")
+            leader = leader.where(~mask, team_ldr)
+
+        # Layer 1: Oppty Region → region_leader_map (highest priority)
+        for rcol in ("Oppty Region", "Owner Region"):
+            if rcol in df.columns:
+                reg_ldr = df[rcol].apply(
+                    lambda r: _clean(region_leader_map.get(str(r).strip(), "")))
+                mask = reg_ldr.ne("")
+                leader = leader.where(~mask, reg_ldr)
+                break   # use the first region column found
+
+    return leader
+
+
 def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
              ldr_quota_map, rep_quota_map, rep_leader_map, rep_team_map,
-             seg_pl, month_nums, year, monthly_factor=0.066687):
+             seg_pl, month_nums, year, monthly_factor=0.066687,
+             region_leader_map=None):
     if isinstance(month_nums, int):
         month_nums = [month_nums]
     month_names = [MONTH_NAMES[m - 1] for m in month_nums]
@@ -551,20 +670,62 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
         BMI_SUM  = ("BMI_ARR",     "sum"),
         SC_SUM   = ("Roll_SC_Ret", "sum"),
         Rep      = ("Opportunity Owner", "first"),
-        Leader   = (mgr_col_ret,        "first"),
-        Team     = ("Oppty Team",        "first"),
         OppName  = ("Opportunity Name",  "first"),
+        Oppty_Region_ret = ("Oppty Region", "first") if "Oppty Region" in ret.columns
+                           else ("Oppty Team", "first"),
+        Team     = ("Oppty Team",        "first"),
     ).reset_index()
     ret_grp["Retention_Credit"] = (ret_grp["BMI_SUM"] - ret_grp["SC_SUM"]).clip(lower=0)
+
+    # Assign leader to each retention deal using the same 4-level priority
+    _ret_for_ldr = ret.copy()
+    _ret_for_ldr["Opportunity Owner"] = _ret_for_ldr["Opportunity Owner"].apply(normalize)
+    ret_grp["Leader"] = _assign_leader(
+        _ret_for_ldr.loc[ret.groupby("Opportunity ID").head(1).index
+                         if False else slice(None)],
+        region_leader_map, mgr_col_ret, rep_leader_map,
+    ).reindex(range(len(ret_grp))).fillna("Unknown")
+
+    # Simpler: reassign per ret_grp row using the first row of each opp group
+    # (already aggregated above — derive leader from ret_grp region columns)
+    _rg = ret_grp.rename(columns={"Oppty_Region_ret": "Oppty Region",
+                                   "Team": "Oppty Team"})
+    _rg["Opportunity Owner"] = _rg["Rep"]
+    if mgr_col_ret in ret.columns:
+        _first_mgr = (ret.groupby("Opportunity ID")[mgr_col_ret]
+                      .first().reset_index()
+                      .rename(columns={mgr_col_ret: "_mgr_ret"}))
+        _rg = _rg.merge(_first_mgr, on="Opportunity ID", how="left")
+        _rg[mgr_col_ret] = _rg.get("_mgr_ret", "")
+    else:
+        _rg[mgr_col_ret] = ""
+    ret_grp["Leader"] = _assign_leader(_rg, region_leader_map,
+                                       mgr_col_ret, rep_leader_map).values
+
     ret_by_oppname = ret_grp.groupby("OppName")["Retention_Credit"].sum().to_dict()
 
     # ── Master dataset ───────────────────────────────────────────────────────
     master = cw.copy()
-    master["Rep"]    = master["Opportunity Owner"]          # normalized above
-    master["Leader"] = master[mgr_col_cw]                  # normalized above
-    master["Region"] = master["Oppty Team"] if "Oppty Team" in master.columns else "Unknown"
-    master["Segment"]= master["Oppty Team"].apply(seg_from_team)
-    master["VP"]     = master["Segment"].map(VP_MAP).fillna("N/A")
+    master["Rep"] = master["Opportunity Owner"]   # normalized above
+
+    # Deal-level leader: Oppty Region → region_leader_map is source of truth.
+    # This correctly handles mid-year transfers: a deal's Oppty Region is
+    # stamped at close and never changes, so it is attributed to whoever
+    # manages that region TODAY regardless of where the owner is now.
+    master["Leader"] = _assign_leader(master, region_leader_map,
+                                      mgr_col_cw, rep_leader_map)
+
+    # Region display: prefer stable Oppty Region; fall back to Oppty Team
+    if "Oppty Region" in master.columns:
+        master["Region"] = master["Oppty Region"].fillna(
+            master.get("Oppty Team", "Unknown")).str.strip()
+    elif "Oppty Team" in master.columns:
+        master["Region"] = master["Oppty Team"]
+    else:
+        master["Region"] = "Unknown"
+
+    master["Segment"] = master["Region"].apply(seg_from_team)
+    master["VP"]      = master["Segment"].map(VP_MAP).fillna("N/A")
     master["Forecast_Amount_ARR"] = pd.to_numeric(master["Forecast Amount"], errors="coerce").fillna(0)
     master["_OppName"] = master["Opportunity Name"].str.strip()
     master["In_Complete"] = master["_OppName"].isin(complete_names).astype(int)
@@ -581,11 +742,14 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
     total_ret   = ret_grp["Retention_Credit"].sum()
 
     # ── Rep aggregation ──────────────────────────────────────────────────────
-    cw_by_rep = master.groupby("Rep").agg(
-        Leader_cw       = ("Leader",          "first"),
-        Region_cw       = ("Region",          "first"),
-        Segment_cw      = ("Segment",         "first"),
-        VP              = ("VP",              "first"),
+    # Sort by Close Date so .last() gives the most recent deal's leader/region,
+    # which represents the rep's CURRENT assignment even if they transferred.
+    master_s = master.sort_values("Close Date", na_position="first")
+    cw_by_rep = master_s.groupby("Rep").agg(
+        Leader_cw       = ("Leader",          "last"),   # current assignment
+        Region_cw       = ("Region",          "last"),
+        Segment_cw      = ("Segment",         "last"),
+        VP              = ("VP",              "last"),
         CW_ARR          = ("CW_ARR_Adjusted", "sum"),
         LTC_Credit      = ("LTC_Uplift",      "sum"),
         Complete_Credit = ("Complete_Credit", "sum"),
@@ -604,8 +768,10 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
         rep_grp[col] = rep_grp[col].fillna(0)
 
     def resolve_leader(row):
+        # Leader_cw already reflects deal-level Oppty Region attribution,
+        # with .last() = current assignment for transferred reps.
         for src in [row.get("Leader_cw",""), row.get("Leader_ret","")]:
-            if isinstance(src, str) and src.strip() not in ("","nan","Unknown","NaN"):
+            if isinstance(src, str) and src.strip().lower() not in ("","nan","unknown","n/a"):
                 return src.strip()
         return rep_leader_map.get(row["Rep"], "Unknown")
 
@@ -617,7 +783,7 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
 
     def resolve_region(row):
         for src in [row.get("Region_cw",""), row.get("Team_ret","")]:
-            if isinstance(src, str) and src.strip() not in ("","nan","Unknown","NaN"):
+            if isinstance(src, str) and src.strip().lower() not in ("","nan","unknown","n/a"):
                 return src.strip()
         return rep_team_map.get(row["Rep"], "Unknown")
 
@@ -712,7 +878,7 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
 # ─────────────────────────────────────────────────────────────────────────────
 for k, v in [("sf", None), ("data", None), ("last_run", None),
               ("raw_cw", None), ("raw_ltc", None), ("raw_ret", None), ("raw_comp", None),
-              ("tgt_bytes", None), ("monthly_factor", None)]:
+              ("tgt_bytes", None), ("monthly_factor", None), ("region_leader_map", {})]:
     if k not in st.session_state:
         st.session_state[k] = v
 
@@ -896,11 +1062,19 @@ with st.sidebar:
                     lq, rq, rlm, rtm, sp, mf = load_quotas(
                         st.session_state.tgt_bytes, month_nums)
                     st.session_state.monthly_factor = mf
+
+                    # Build live Region → Leader map from the full CW ARR
+                    # dataset just fetched.  Uses most-recent-month deals per
+                    # region so it always reflects the current org structure.
+                    rlm_region = build_region_leader_map(st.session_state.raw_cw)
+                    st.session_state.region_leader_map = rlm_region
+
                     result = run_calc(
                         st.session_state.raw_cw,  st.session_state.raw_ltc,
                         st.session_state.raw_ret, st.session_state.raw_comp,
                         lq, rq, rlm, rtm, sp, month_nums, int(sel_year),
-                        monthly_factor=mf)
+                        monthly_factor=mf,
+                        region_leader_map=rlm_region)
                     st.session_state.data     = result
                     st.session_state.last_run = datetime.now()
                 except Exception as e:
