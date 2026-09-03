@@ -11,6 +11,8 @@ from calendar import monthrange
 from datetime import datetime
 from pathlib import Path
 
+import requests as _requests   # used for direct POST to SFDC Analytics API
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -141,11 +143,58 @@ def sf_connect_session(session_id, instance_url="https://sapconcur.my.salesforce
     return Salesforce(session_id=session_id, instance_url=instance_url)
 
 
-_meta_cache: dict = {}   # module-level cache: report_id → reportMetadata dict
+_meta_cache: dict = {}   # module-level: report_id → full API response dict
+
+
+def _sf_base_url(sf):
+    """Return the REST API base URL from a simple_salesforce connection object."""
+    # simple_salesforce v1.x stores it in base_url; fall back to building it
+    for attr in ("base_url", "sf_url"):
+        val = getattr(sf, attr, None)
+        if val and "services/data" in str(val):
+            return str(val).rstrip("/") + "/"
+    instance = getattr(sf, "sf_instance", "sapconcur.my.salesforce.com")
+    version  = getattr(sf, "sf_version",  "57.0")
+    return f"https://{instance}/services/data/v{version}/"
+
+
+def _post_report(sf, report_id, body_dict, params=None):
+    """POST to the Salesforce Analytics Reports API using direct requests.
+
+    CRITICAL: we bypass simple_salesforce's restful(data=string) here.
+    Using requests.post(json=body_dict) guarantees:
+      • body_dict is serialised to JSON by the requests library
+      • Content-Type: application/json is set automatically
+      • The body actually arrives at Salesforce (simple_salesforce's data=
+        path has version-specific quirks that can silently drop the body)
+
+    Returns the parsed JSON response dict, or raises on non-200 status.
+    """
+    url     = _sf_base_url(sf) + f"analytics/reports/{report_id}"
+    headers = {
+        "Authorization": f"Bearer {sf.session_id}",
+        "Content-Type":  "application/json",
+        "Accept":        "application/json",
+    }
+    resp = _requests.post(
+        url,
+        json=body_dict,          # requests serialises + sets Content-Type
+        headers=headers,
+        params=params or {"includeDetails": "true"},
+        timeout=60,
+    )
+    if resp.status_code == 200:
+        return resp.json()
+    raise Exception(f"SFDC POST HTTP {resp.status_code}: {resp.text[:400]}")
 
 
 def _sf_get_meta(sf, report_id):
-    """Fetch report metadata without running it (cached per session)."""
+    """Fetch full report metadata (cached per module lifetime).
+
+    Caches the COMPLETE response so we can inspect both reportMetadata
+    and reportExtendedMetadata (needed for column label → API name mapping
+    and for the diagnostic display).
+    """
     if report_id not in _meta_cache:
         try:
             r = sf.restful(
@@ -153,7 +202,7 @@ def _sf_get_meta(sf, report_id):
                 method="GET",
                 params={"includeDetails": "false"},
             )
-            _meta_cache[report_id] = r.get("reportMetadata", {})
+            _meta_cache[report_id] = r          # store full response
         except Exception:
             _meta_cache[report_id] = {}
     return _meta_cache[report_id]
@@ -162,28 +211,27 @@ def _sf_get_meta(sf, report_id):
 def sf_run_report(sf, report_id, start_date=None, end_date=None):
     """Run a Salesforce Analytics report and return (DataFrame, row_count).
 
-    Three sequential POST attempts — never mixing mechanisms in one body.
-    Each attempt is isolated; a failure in one does not affect the others.
+    Three sequential POST attempts using DIRECT requests.post() calls —
+    this bypasses simple_salesforce's restful(data=string) which can silently
+    drop the POST body in some library versions, causing Salesforce to run the
+    report with its default (full-year) filter instead of our date override.
 
-      Attempt 1 — standardDateFilter (hardcoded CLOSE_DATE)
-        Works for LTC, Complete, Retention.
-        Accepted only if response < 2 000 rows.
+      Attempt 1 — standardDateFilter on CLOSE_DATE
+        Correct approach for any report whose Standard Date Filter is on
+        Close Date (LTC, Complete, Retention, and CW ARR if configured right).
+        Accepted if response < 2,000 rows.
 
-      Attempt 2 — metadata-aware filter rebuild
-        Fetches the report's saved metadata (lightweight, cached).
-        Finds the ACTUAL standard-date-filter column (may differ from
-        CLOSE_DATE for some reports).  Strips any existing date filters
-        from the saved reportFilters list, preserving Stage / Type / other
-        criteria, then adds our explicit date range.
-        This is the most correct approach for reports like CW ARR that
-        use a custom date filter with a non-standard column name.
-        Accepted only if response < 2 000 rows.
+      Attempt 2 — metadata-aware rebuild
+        Fetches the report's saved metadata to find the ACTUAL standard-date-
+        filter column (may not be CLOSE_DATE for all reports).  Preserves all
+        non-date reportFilters (Stage, Team, Type, etc.) and replaces only the
+        date scope.  Accepted if response < 2,000 rows.
 
       Attempt 3 — reportFilters only, plain CLOSE_DATE (last resort)
-        Accepted regardless of row count (the dedup step in
-        sf_run_report_multi handles any lingering duplicates).
+        Accepted regardless of row count; dedup in sf_run_report_multi handles
+        any lingering full-year duplicates.
 
-      GET fallback — only if all three POSTs raise an exception.
+      GET fallback — only if all three POSTs throw an exception.
 
     All attempt results are logged to st.session_state.sf_post_debug.
     """
@@ -194,7 +242,7 @@ def sf_run_report(sf, report_id, start_date=None, end_date=None):
     if "sf_post_debug" not in st.session_state:
         st.session_state.sf_post_debug = {}
 
-    # Common date-field API names to treat as "date filters" when rebuilding
+    # Date-field API names to strip when rebuilding filters
     _DATE_COLS = {
         "CLOSE_DATE", "CLOSEDATE", "CLOSED_DATE",
         "CREATEDDATE", "LASTMODIFIEDDATE",
@@ -205,7 +253,7 @@ def sf_run_report(sf, report_id, start_date=None, end_date=None):
 
         # ── Attempt 1: standardDateFilter on CLOSE_DATE ───────────────────────
         try:
-            body1 = json.dumps({
+            r1 = _post_report(sf, report_id, {
                 "reportMetadata": {
                     "standardDateFilter": {
                         "column":        "CLOSE_DATE",
@@ -214,30 +262,23 @@ def sf_run_report(sf, report_id, start_date=None, end_date=None):
                         "endDate":       end_date,
                     }
                 }
-            })
-            r1 = sf.restful(
-                path=f"analytics/reports/{report_id}",
-                method="POST",
-                data=body1,
-                params=params,
-            )
+            }, params)
             n1 = len(r1.get("factMap", {}).get("T!T", {}).get("rows", []))
             if n1 < 2000:
                 result = r1
                 debug.append(f"A1(stdDateFilter/CLOSE_DATE) OK → {n1} rows")
             else:
-                debug.append(f"A1(stdDateFilter/CLOSE_DATE) → {n1} rows (cap=filter ignored)")
+                debug.append(f"A1(stdDateFilter/CLOSE_DATE) → {n1} rows (2000-cap hit; trying A2)")
         except Exception as e1:
-            debug.append(f"A1(stdDateFilter/CLOSE_DATE) ERR: {e1}")
+            debug.append(f"A1 ERR: {e1}")
 
         # ── Attempt 2: metadata-aware rebuild ────────────────────────────────
         if result is None:
             try:
-                saved_meta     = _sf_get_meta(sf, report_id)
-                # Find the actual standard date filter column (may not be CLOSE_DATE)
+                full_meta      = _sf_get_meta(sf, report_id)
+                saved_meta     = full_meta.get("reportMetadata", {})
                 std_info       = saved_meta.get("standardDateFilter") or {}
                 std_col        = std_info.get("column", "CLOSE_DATE")
-                # Preserve non-date custom filters; replace any date-column filters
                 saved_filters  = saved_meta.get("reportFilters") or []
                 non_date       = [
                     f for f in saved_filters
@@ -247,7 +288,7 @@ def sf_run_report(sf, report_id, start_date=None, end_date=None):
                     {"column": std_col, "operator": "greaterOrEqual", "value": start_date},
                     {"column": std_col, "operator": "lessOrEqual",    "value": end_date},
                 ]
-                body2 = json.dumps({
+                r2 = _post_report(sf, report_id, {
                     "reportMetadata": {
                         "standardDateFilter": {
                             "column":        std_col,
@@ -257,46 +298,34 @@ def sf_run_report(sf, report_id, start_date=None, end_date=None):
                         },
                         "reportFilters": new_filters,
                     }
-                })
-                r2 = sf.restful(
-                    path=f"analytics/reports/{report_id}",
-                    method="POST",
-                    data=body2,
-                    params=params,
-                )
+                }, params)
                 n2 = len(r2.get("factMap", {}).get("T!T", {}).get("rows", []))
                 if n2 < 2000:
                     result = r2
                     debug.append(f"A2(meta-rebuild/col={std_col}) OK → {n2} rows")
                 else:
-                    debug.append(f"A2(meta-rebuild/col={std_col}) → {n2} rows (cap=filter still ignored)")
+                    debug.append(f"A2(meta-rebuild/col={std_col}) → {n2} rows (still 2000-cap; trying A3)")
             except Exception as e2:
-                debug.append(f"A2(meta-rebuild) ERR: {e2}")
+                debug.append(f"A2 ERR: {e2}")
 
         # ── Attempt 3: plain reportFilters on CLOSE_DATE (last resort) ───────
         if result is None:
             try:
-                body3 = json.dumps({
+                r3 = _post_report(sf, report_id, {
                     "reportMetadata": {
                         "reportFilters": [
                             {"column": "CLOSE_DATE", "operator": "greaterOrEqual", "value": start_date},
                             {"column": "CLOSE_DATE", "operator": "lessOrEqual",    "value": end_date},
                         ]
                     }
-                })
-                r3 = sf.restful(
-                    path=f"analytics/reports/{report_id}",
-                    method="POST",
-                    data=body3,
-                    params=params,
-                )
+                }, params)
                 n3 = len(r3.get("factMap", {}).get("T!T", {}).get("rows", []))
                 result = r3   # accept regardless — dedup handles duplicates
-                debug.append(f"A3(reportFilters/CLOSE_DATE) → {n3} rows (accepted; dedup will handle if cap hit)")
+                debug.append(f"A3(reportFilters/CLOSE_DATE) → {n3} rows (accepted; dedup active)")
             except Exception as e3:
-                debug.append(f"A3(reportFilters/CLOSE_DATE) ERR: {e3}")
+                debug.append(f"A3 ERR: {e3}")
 
-    # ── GET fallback ──────────────────────────────────────────────────────────
+    # ── GET fallback — only if all three POSTs threw exceptions ──────────────
     if result is None:
         result = sf.restful(
             path=f"analytics/reports/{report_id}",
@@ -979,7 +1008,7 @@ with st.expander("Report Data Diagnostic — expand to inspect raw data", expand
     # ── POST attempt trace (shows exactly which path was taken per report) ───
     _dbg = st.session_state.get("sf_post_debug", {})
     if _dbg:
-        st.markdown("**POST Attempt Log**")
+        st.markdown("**POST Attempt Log** *(A1=direct standardDateFilter, A2=metadata-rebuild, A3=reportFilters only)*")
         _rpt_ids = {
             st.secrets.get("reports", {}).get("cw_arr_report_id",  "—"): "CW ARR",
             st.secrets.get("reports", {}).get("ltc_report_id",     "—"): "LTC",
@@ -988,15 +1017,39 @@ with st.expander("Report Data Diagnostic — expand to inspect raw data", expand
         }
         for _rid, _trace in _dbg.items():
             _name = _rpt_ids.get(_rid, _rid)
-            st.caption(f"{_name}: {_trace}")
+            st.caption(f"**{_name}**: {_trace}")
         st.markdown("---")
+
+    # ── Salesforce report saved configuration ─────────────────────────────
+    st.markdown("**Salesforce Report Configuration** *(from saved metadata — helps diagnose filter issues)*")
+    _rpt_label_ids = {
+        "CW ARR":    st.secrets.get("reports", {}).get("cw_arr_report_id",  None),
+        "LTC":       st.secrets.get("reports", {}).get("ltc_report_id",     None),
+        "Retention": st.secrets.get("reports", {}).get("retention_report_id",None),
+        "Complete":  st.secrets.get("reports", {}).get("complete_report_id", None),
+    }
+    for _lbl, _rid in _rpt_label_ids.items():
+        if _rid and _rid in _meta_cache:
+            _cached = _meta_cache[_rid]
+            _rm = _cached.get("reportMetadata", {})
+            _sdf = _rm.get("standardDateFilter")
+            _rf  = _rm.get("reportFilters", [])
+            st.caption(
+                f"**{_lbl}** | standardDateFilter: {json.dumps(_sdf)} "
+                f"| reportFilters ({len(_rf)} rows): "
+                + ", ".join(f.get("column","?") for f in _rf[:6])
+            )
+        elif _rid:
+            st.caption(f"**{_lbl}**: metadata not yet loaded (run reports first)")
+    st.markdown("---")
 
     # ── Dedup trace ──────────────────────────────────────────────────────────
     _dedup = st.session_state.get("sf_dedup_info", {})
     if _dedup:
-        st.markdown("**Deduplication Log** (appears when a report ignores the API date filter)")
+        st.markdown("**Deduplication Log** *(appears when a report ignores the API date filter — "
+                    "indicates the direct POST body is still not being applied)*")
         for _rid, _msg in _dedup.items():
-            _name = _rpt_ids.get(_rid, _rid)
+            _name = _rpt_ids.get(_rid, _rid) if _dbg else _rid
             st.warning(f"**{_name}**: {_msg}")
         st.markdown("---")
 
