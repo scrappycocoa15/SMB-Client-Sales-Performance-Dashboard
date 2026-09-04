@@ -423,11 +423,18 @@ def sf_run_report(sf, report_id, start_date=None, end_date=None):
     return df, len(records)
 
 
-def sf_run_report_multi(sf, report_id, month_nums, year):
+def sf_run_report_multi(sf, report_id, month_nums, year, full_year=False):
     """Run a report one month at a time and concatenate results.
 
     Makes len(month_nums) POST calls, each scoped to a single calendar month.
     Falls back to GET per month if POST is rejected.
+
+    full_year=True: makes a SINGLE call spanning the entire year (Jan 1 – Dec 31).
+    Use this for reports whose standard date field is a text/formula picklist
+    (e.g. Retention's "Final Month Closed") so that the API cannot filter by month.
+    A full-year call ensures standalone deals (prior-month close / current-month
+    recognition) are not missed, while excluding true prior-year rows if the API
+    filter works.  Python's FMC filter then scopes to the correct months.
 
     IMPORTANT — deduplication:
     If the Salesforce report's date filter cannot be overridden via the API
@@ -441,6 +448,13 @@ def sf_run_report_multi(sf, report_id, month_nums, year):
 
     Returns (combined DataFrame, total row count).
     """
+    if full_year:
+        start = f"{year}-01-01"
+        end   = f"{year}-12-31"
+        df, _ = sf_run_report(sf, report_id, start, end)
+        combined = df.drop_duplicates()
+        return combined, len(combined)
+
     dfs = []
     for m in month_nums:
         start    = f"{year}-{m:02d}-01"
@@ -653,11 +667,22 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
     _month_year_short    = [f"{mn[:3]} {year}" for mn in month_names]       # ["Jun 2026"]
     _month_year_hyphen   = [f"{mn[:3]}-{year}" for mn in month_names]       # ["Jun-2026"]
     _month_only          = month_names                                        # ["June"]
-    # For month-only values, cross-validate against Close Date year
-    _close_yr = pd.to_datetime(ret.get("Close Date", pd.Series(dtype=str)),
-                               errors="coerce").dt.year
+    # For month-only values ("June"), cross-validate against Close Date year when
+    # the column is present.  Using ret.get() on a DataFrame returns a COLUMN
+    # (Series) if it exists, or a default.  Using a zero-length default Series
+    # caused all rows to be dropped.  Guard with an explicit column check instead.
     _match_explicit = _fmc.isin(_month_year_explicit + _month_year_short + _month_year_hyphen)
-    _match_month_only = _fmc.isin(_month_only) & _close_yr.eq(year).fillna(False)
+    if "Close Date" in ret.columns:
+        _close_yr     = pd.to_datetime(ret["Close Date"], errors="coerce").dt.year
+        _match_month_only = _fmc.isin(_month_only) & _close_yr.eq(year).fillna(False)
+    else:
+        # Close Date not in the Retention report — cannot do year cross-validation.
+        # The API was called with a full-year (Jan–Dec year) range, so any rows
+        # returned with a prior-year close date should already be excluded by the
+        # API filter.  Accept all FMC-matching records.
+        # To enable strict year validation, add a "Close Date" column to the
+        # Salesforce Retention report and re-run.
+        _match_month_only = _fmc.isin(_month_only)
     ret = ret[_match_explicit | _match_month_only].copy()
     ret["Opportunity Owner"] = ret["Opportunity Owner"].apply(normalize)
     mgr_col_ret = "Oppty Manager" if "Oppty Manager" in ret.columns else "Opportunity Owner: Manager"
@@ -670,22 +695,16 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
     ret = ret[~split_mask].copy()
 
     comp = comp_raw.copy()
-    # ── Year-aware Close Month filter ────────────────────────────────────────
-    # Close Month may be a text formula ("June 2026", "Jun-25", "6/1/2026").
-    # pd.to_datetime can silently misparse "Jun-25" as June 25 current year,
-    # making dt.year == 2026 pass for a 2025 deal.  We layer two checks:
-    #   1. dt.year == year  AND  dt.month in month_nums  (parsed date)
-    #   2. raw string contains str(year) AND month name/number  (belt-and-suspenders)
-    _cm_raw = comp["Close Month"].astype(str).str.strip()
-    comp["_cm_parsed"] = pd.to_datetime(_cm_raw, errors="coerce", dayfirst=False)
-    # String-level year check: the raw cell must mention the target year
-    _str_year_ok   = _cm_raw.str.contains(str(year), na=False)
-    _str_month_ok  = _cm_raw.str.contains(
-        "|".join([str(m) for m in month_nums] + month_names + [mn[:3] for mn in month_names]),
-        case=False, na=False)
-    _date_ok = (comp["_cm_parsed"].dt.year == year) & \
-               (comp["_cm_parsed"].dt.month.isin(month_nums))
-    comp = comp[_date_ok & _str_year_ok | (_str_year_ok & _str_month_ok)].copy()
+    # ── Close Month filter ──────────────────────────────────────────────────
+    # Close Month is a date formula field; the Analytics API returns ISO format
+    # ("2026-06-01") or parseable text ("June 2026").  Parse with pd.to_datetime
+    # and filter on year + month.  The broken v16 approach used str.contains on
+    # the digit "6" which matched "2026" itself, letting all 12 months of 2026
+    # through and inflating the Complete total.
+    comp["_cm_parsed"] = pd.to_datetime(
+        comp["Close Month"].astype(str).str.strip(), errors="coerce", dayfirst=False)
+    comp = comp[(comp["_cm_parsed"].dt.year  == year) &
+                (comp["_cm_parsed"].dt.month.isin(month_nums))].copy()
     comp.drop(columns=["_cm_parsed"], inplace=True)
     comp["Opportunity Owner"] = comp["Opportunity Owner"].apply(normalize)
     comp["Complete_Credit_Val"] = pd.to_numeric(
@@ -1057,7 +1076,11 @@ with st.sidebar:
 
                     cw_df,  n1 = sf_run_report_multi(sf, rpt_cw,   month_nums, _yr)
                     ltc_df, n2 = sf_run_report_multi(sf, rpt_ltc,  month_nums, _yr)
-                    ret_df, n3 = sf_run_report_multi(sf, rpt_ret,  month_nums, _yr)
+                    # Retention: full-year call so standalone deals (prior-month
+                    # close / current-month FMC recognition) are not dropped by a
+                    # tight month-range filter.  Python's FMC filter scopes months.
+                    ret_df, n3 = sf_run_report_multi(sf, rpt_ret,  month_nums, _yr,
+                                                     full_year=True)
                     comp_df,n4 = sf_run_report_multi(sf, rpt_comp, month_nums, _yr)
                     st.session_state.raw_cw   = cw_df
                     st.session_state.raw_ltc  = ltc_df
@@ -1276,6 +1299,21 @@ with st.expander("Report Data Diagnostic — expand to inspect raw data", expand
             st.caption(f"Date distribution (year-month: count): {_dist.to_dict()}")
         elif _dcol not in _raw.columns:
             st.warning(f"Column '{_dcol}' NOT FOUND in report. Available: {list(_raw.columns)}")
+        # Complete: show all unique Close Month values and raw credit sum before
+        # any Python filtering so we can see exactly what the API returned.
+        if _lbl == "Complete" and len(_raw) > 0:
+            _cm_uniq = _raw["Close Month"].astype(str).str.strip().unique().tolist() if "Close Month" in _raw.columns else []
+            st.caption(f"All unique 'Close Month' raw values ({len(_cm_uniq)}): {_cm_uniq[:20]}")
+            _sc_col = "Roll-up Sales Credit Calculation (converted)"
+            if _sc_col in _raw.columns:
+                _raw_credit_sum = pd.to_numeric(_raw[_sc_col], errors="coerce").sum()
+                st.caption(f"Raw credit sum (ALL {len(_raw)} rows, before Python filter): ${_raw_credit_sum:,.0f}")
+        # Retention: show FMC unique values so we know if year is embedded
+        if _lbl == "Retention" and len(_raw) > 0 and "Final Month Closed" in _raw.columns:
+            _fmc_uniq = _raw["Final Month Closed"].dropna().unique().tolist()[:20]
+            st.caption(f"All unique 'Final Month Closed' values: {_fmc_uniq}")
+            _has_cd = "Close Date" in _raw.columns
+            st.caption(f"'Close Date' column present in Retention report: {_has_cd}")
         st.markdown("---")
 
 # ── Row 2: Segment chart + Component donut ─────────────────────────────────
