@@ -266,6 +266,44 @@ def _sf_get_meta(sf, report_id):
     return _meta_cache[report_id]
 
 
+def _fetch_all_pages(sf, report_id, first_result, body_dict, base_params):
+    """Paginate through a capped Salesforce Analytics API response.
+
+    The Analytics API returns at most 2,000 rows per call.  When allData is
+    False in the response, additional rows are available via the startRow
+    query parameter.  We fetch them in 2,000-row increments and merge into
+    the first call's row list.
+
+    body_dict — the POST body that succeeded (None → use GET for subsequent pages)
+    base_params — query-string params used on the first call
+
+    Returns the combined list of raw row dicts (all pages).
+    """
+    combined = list(first_result.get("factMap", {}).get("T!T", {}).get("rows", []))
+    current  = first_result
+    page     = 1
+    MAX_PAGES = 15          # 15 × 2,000 = 30,000 row ceiling
+
+    while not current.get("allData", True) and page < MAX_PAGES:
+        pg_params = dict(base_params)
+        pg_params["startRow"] = page * 2000
+        try:
+            if body_dict is not None:
+                current = _post_report(sf, report_id, body_dict, pg_params)
+            else:
+                current = sf.restful(
+                    path=f"analytics/reports/{report_id}",
+                    method="GET",
+                    params=pg_params,
+                )
+            combined.extend(current.get("factMap", {}).get("T!T", {}).get("rows", []))
+            page += 1
+        except Exception:
+            break           # stop pagination on error; return what we have so far
+
+    return combined
+
+
 def sf_run_report(sf, report_id, start_date=None, end_date=None):
     """Run a Salesforce Analytics report and return (DataFrame, row_count).
 
@@ -302,6 +340,8 @@ def sf_run_report(sf, report_id, start_date=None, end_date=None):
     params = {"includeDetails": "true"}
     result = None
     debug  = []
+    _winning_body   = None   # POST body that produced result (None → GET)
+    _winning_params = params  # query params used for winning call
 
     if "sf_post_debug" not in st.session_state:
         st.session_state.sf_post_debug = {}
@@ -318,7 +358,7 @@ def sf_run_report(sf, report_id, start_date=None, end_date=None):
         # ── Attempt 1: minimal standardDateFilter (fast path, no metadata call)
         _a1_bucket_err = False
         try:
-            r1 = _post_report(sf, report_id, {
+            _a1_body = {
                 "reportMetadata": {
                     "standardDateFilter": {
                         "column":        "CLOSE_DATE",
@@ -327,15 +367,16 @@ def sf_run_report(sf, report_id, start_date=None, end_date=None):
                         "endDate":       end_date,
                     }
                 }
-            }, params)
+            }
+            r1 = _post_report(sf, report_id, _a1_body, params)
             n1 = len(r1.get("factMap", {}).get("T!T", {}).get("rows", []))
-            if n1 < 2000:
-                result = r1
-                debug.append(f"A1(stdDateFilter/CLOSE_DATE) OK → {n1} rows")
-            else:
-                debug.append(
-                    f"A1(stdDateFilter/CLOSE_DATE) → {n1} rows "
-                    f"(2000-cap hit; trying full-meta A2)")
+            all1 = r1.get("allData", True)
+            result = r1
+            _winning_body   = _a1_body
+            _winning_params = params
+            debug.append(
+                f"A1(stdDateFilter/CLOSE_DATE) OK → {n1} rows"
+                + ("" if all1 else " [paginating…]"))
         except Exception as e1:
             err_str = str(e1)
             if "BucketField" in err_str:
@@ -347,9 +388,6 @@ def sf_run_report(sf, report_id, start_date=None, end_date=None):
                 debug.append(f"A1 ERR: {err_str}")
 
         # ── Attempt 2: FULL saved-metadata POST, only date patched ───────────
-        # This is the only approach that works for reports containing Bucket
-        # Fields.  We deep-copy the entire saved reportMetadata so that the
-        # BucketField definition (and everything else) is preserved.
         if result is None:
             try:
                 full_resp  = _sf_get_meta(sf, report_id)
@@ -381,17 +419,16 @@ def sf_run_report(sf, report_id, start_date=None, end_date=None):
                      "value": end_date},
                 ]
 
-                r2 = _post_report(sf, report_id,
-                                  {"reportMetadata": patched_meta}, params)
+                _a2_body = {"reportMetadata": patched_meta}
+                r2 = _post_report(sf, report_id, _a2_body, params)
                 n2 = len(r2.get("factMap", {}).get("T!T", {}).get("rows", []))
-                if n2 < 2000:
-                    result = r2
-                    debug.append(
-                        f"A2(full-meta/col={std_col}) OK → {n2} rows")
-                else:
-                    debug.append(
-                        f"A2(full-meta/col={std_col}) → {n2} rows "
-                        f"(still 2000-cap — GET fallback will be used)")
+                all2 = r2.get("allData", True)
+                result = r2
+                _winning_body   = _a2_body
+                _winning_params = params
+                debug.append(
+                    f"A2(full-meta/col={std_col}) OK → {n2} rows"
+                    + ("" if all2 else " [paginating…]"))
             except Exception as e2:
                 debug.append(f"A2 ERR: {e2}")
 
@@ -403,19 +440,26 @@ def sf_run_report(sf, report_id, start_date=None, end_date=None):
             params=params,
         )
         nG = len(result.get("factMap", {}).get("T!T", {}).get("rows", []))
-        debug.append(f"GET-fallback → {nG} rows")
+        all_g = result.get("allData", True)
+        _winning_body   = None
+        _winning_params = params
+        debug.append(f"GET-fallback → {nG} rows" + ("" if all_g else " [paginating…]"))
+
+    # ── Pagination: fetch remaining pages if allData is False ────────────────
+    all_rows = _fetch_all_pages(
+        sf, report_id, result, _winning_body, _winning_params)
+    if len(all_rows) > len(result.get("factMap", {}).get("T!T", {}).get("rows", [])):
+        debug.append(f"pagination complete → {len(all_rows)} total rows")
 
     st.session_state.sf_post_debug[report_id] = " | ".join(debug)
 
     meta   = result.get("reportMetadata", {})
     ext    = result.get("reportExtendedMetadata", {})
-    fmap   = result.get("factMap", {})
     cols   = meta.get("detailColumns", [])
     cinfo  = ext.get("detailColumnInfo", {})
     labels = [cinfo.get(c, {}).get("label", c) for c in cols]
-    rows   = fmap.get("T!T", {}).get("rows", [])
     records = []
-    for row in rows:
+    for row in all_rows:
         cells = row.get("dataCells", [])
         records.append({labels[i]: _cell_val(cells[i])
                         for i in range(min(len(labels), len(cells)))})
