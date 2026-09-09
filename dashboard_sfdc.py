@@ -6,7 +6,7 @@ engine, and renders an interactive monthly performance dashboard.
 Run:  streamlit run dashboard_sfdc.py
 """
 
-import io, json, re, warnings
+import io, json, re, time as _time, warnings
 from calendar import monthrange
 from datetime import datetime
 from pathlib import Path
@@ -246,6 +246,93 @@ def _post_report(sf, report_id, body_dict, params=None):
     raise Exception(f"SFDC POST HTTP {resp.status_code}: {resp.text[:400]}")
 
 
+def _post_report_async(sf, report_id, body_dict, params=None):
+    """Create an async report instance, poll until complete, return (payload, inst_id).
+
+    Uses /analytics/reports/{id}/instances (async) instead of the sync
+    /analytics/reports/{id} endpoint.  Async instances draw from a separate
+    1,200/hr rate limit so they do not compete with the 500/hr synchronous
+    run quota — critical when multiple users run the app concurrently.
+
+    The returned payload has IDENTICAL JSON structure to a synchronous run
+    (same factMap / reportMetadata / allData keys), so all existing parse
+    logic works without modification.
+
+    Returns (payload_dict, instance_id).
+    Raises RuntimeError on report failure, TimeoutError if > 120 s elapses.
+    """
+    base_url = _sf_base_url(sf)
+    headers  = {
+        "Authorization": f"Bearer {sf.session_id}",
+        "Content-Type":  "application/json",
+        "Accept":        "application/json",
+    }
+    _params = params or {"includeDetails": "true"}
+
+    # ── Fire the async instance ───────────────────────────────────────────────
+    inst_url  = base_url + f"analytics/reports/{report_id}/instances"
+    post_resp = _requests.post(
+        inst_url,
+        json=body_dict or {},
+        headers=headers,
+        params=_params,
+        timeout=30,
+    )
+    if post_resp.status_code not in (200, 201):
+        raise Exception(
+            f"SFDC async POST HTTP {post_resp.status_code}: {post_resp.text[:400]}")
+    inst_id  = post_resp.json()["id"]
+    poll_url = base_url + f"analytics/reports/{report_id}/instances/{inst_id}"
+
+    # ── Poll until Success (up to 120 s) ─────────────────────────────────────
+    for _ in range(60):
+        _time.sleep(2)
+        poll = _requests.get(poll_url, headers=headers, params=_params, timeout=30)
+        poll.raise_for_status()
+        payload = poll.json()
+        status  = payload.get("attributes", {}).get("status", "")
+        if status == "Success":
+            return payload, inst_id
+        if status in ("Error", "Cancelled"):
+            err = payload.get("attributes", {}).get("errorCode", "unknown")
+            raise RuntimeError(f"Report instance {inst_id} failed: {err}")
+
+    raise TimeoutError(f"Report instance {inst_id} did not complete within 120 s")
+
+
+def _fetch_all_pages_async(sf, report_id, inst_id, first_result, base_params):
+    """Paginate through an async instance's rows using GET startRow.
+
+    Reuses the already-completed instance — zero new instance creation, zero
+    extra rate-limit cost.  Each GET fetches the next 2,000 rows from the
+    cached instance result.
+
+    Returns the combined list of raw row dicts (all pages).
+    """
+    combined = list(first_result.get("factMap", {}).get("T!T", {}).get("rows", []))
+    current  = first_result
+    page     = 1
+    MAX_PAGES = 15      # 15 × 2,000 = 30,000 row ceiling
+
+    base_url = _sf_base_url(sf)
+    headers  = {"Authorization": f"Bearer {sf.session_id}", "Accept": "application/json"}
+    poll_url = base_url + f"analytics/reports/{report_id}/instances/{inst_id}"
+
+    while not current.get("allData", True) and page < MAX_PAGES:
+        pg_params = dict(base_params)
+        pg_params["startRow"] = page * 2000
+        try:
+            resp = _requests.get(poll_url, headers=headers, params=pg_params, timeout=30)
+            resp.raise_for_status()
+            current = resp.json()
+            combined.extend(current.get("factMap", {}).get("T!T", {}).get("rows", []))
+            page += 1
+        except Exception:
+            break
+
+    return combined
+
+
 def _sf_get_meta(sf, report_id):
     """Fetch full report metadata (cached per module lifetime).
 
@@ -340,8 +427,9 @@ def sf_run_report(sf, report_id, start_date=None, end_date=None):
     params = {"includeDetails": "true"}
     result = None
     debug  = []
-    _winning_body   = None   # POST body that produced result (None → GET)
-    _winning_params = params  # query params used for winning call
+    _winning_body    = None   # POST body that produced result (None → GET)
+    _winning_params  = params  # query params used for winning call
+    _winning_inst_id = None   # async instance id (None → sync GET fallback)
 
     if "sf_post_debug" not in st.session_state:
         st.session_state.sf_post_debug = {}
@@ -368,12 +456,13 @@ def sf_run_report(sf, report_id, start_date=None, end_date=None):
                     }
                 }
             }
-            r1 = _post_report(sf, report_id, _a1_body, params)
+            r1, _a1_inst_id = _post_report_async(sf, report_id, _a1_body, params)
             n1 = len(r1.get("factMap", {}).get("T!T", {}).get("rows", []))
             all1 = r1.get("allData", True)
             result = r1
-            _winning_body   = _a1_body
-            _winning_params = params
+            _winning_body    = _a1_body
+            _winning_params  = params
+            _winning_inst_id = _a1_inst_id
             debug.append(
                 f"A1(stdDateFilter/CLOSE_DATE) OK → {n1} rows"
                 + ("" if all1 else " [paginating…]"))
@@ -420,19 +509,20 @@ def sf_run_report(sf, report_id, start_date=None, end_date=None):
                 ]
 
                 _a2_body = {"reportMetadata": patched_meta}
-                r2 = _post_report(sf, report_id, _a2_body, params)
+                r2, _a2_inst_id = _post_report_async(sf, report_id, _a2_body, params)
                 n2 = len(r2.get("factMap", {}).get("T!T", {}).get("rows", []))
                 all2 = r2.get("allData", True)
                 result = r2
-                _winning_body   = _a2_body
-                _winning_params = params
+                _winning_body    = _a2_body
+                _winning_params  = params
+                _winning_inst_id = _a2_inst_id
                 debug.append(
                     f"A2(full-meta/col={std_col}) OK → {n2} rows"
                     + ("" if all2 else " [paginating…]"))
             except Exception as e2:
                 debug.append(f"A2 ERR: {e2}")
 
-    # ── GET fallback — only if both POSTs threw exceptions ───────────────────
+    # ── GET fallback — only if both async POSTs threw exceptions ────────────
     if result is None:
         result = sf.restful(
             path=f"analytics/reports/{report_id}",
@@ -441,13 +531,20 @@ def sf_run_report(sf, report_id, start_date=None, end_date=None):
         )
         nG = len(result.get("factMap", {}).get("T!T", {}).get("rows", []))
         all_g = result.get("allData", True)
-        _winning_body   = None
-        _winning_params = params
+        _winning_body    = None
+        _winning_params  = params
+        _winning_inst_id = None
         debug.append(f"GET-fallback → {nG} rows" + ("" if all_g else " [paginating…]"))
 
     # ── Pagination: fetch remaining pages if allData is False ────────────────
-    all_rows = _fetch_all_pages(
-        sf, report_id, result, _winning_body, _winning_params)
+    # Async path: reuse the completed instance via GET startRow (no new instance).
+    # Sync fallback path: use the original _fetch_all_pages helper.
+    if _winning_inst_id:
+        all_rows = _fetch_all_pages_async(
+            sf, report_id, _winning_inst_id, result, _winning_params)
+    else:
+        all_rows = _fetch_all_pages(
+            sf, report_id, result, _winning_body, _winning_params)
     if len(all_rows) > len(result.get("factMap", {}).get("T!T", {}).get("rows", [])):
         debug.append(f"pagination complete → {len(all_rows)} total rows")
 
@@ -1506,6 +1603,87 @@ with st.expander("Segment Detail Table"):
         {"Total Credited":"${:,.0f}","P&L Quota":"${:,.0f}","Linearity Target":"${:,.0f}",
          "% to P&L":"{:.1f}%","% to Lin":"{:.1f}%"}),
         use_container_width=True)
+
+# ── Row 6: Leader Excel Download ───────────────────────────────────────────
+st.markdown("<br>", unsafe_allow_html=True)
+st.markdown("<div class='sh'>Leader Report Download</div>", unsafe_allow_html=True)
+
+def _build_leader_excel(ldr_data, rep_data, seg_data, label):
+    """Build a three-sheet Excel workbook: Leader Summary, Rep Detail, Segment Summary."""
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+
+        # ── Sheet 1: Leader Summary ───────────────────────────────────────────
+        ld = ldr_data[ldr_data["Segment"].isin(["Key","Premier","Strategic"])].copy()
+        ld["Pct_to_Linearity"] = (ld["Pct_to_Linearity"].fillna(0) * 100).round(1)
+        ld = ld[["Leader","Segment","Monthly_Quota","CW_ARR","LTC_Credit",
+                  "Retention_Credit","Complete_Credit","Total_Credited",
+                  "CW_Units","Pct_to_Linearity"]].copy()
+        ld.rename(columns={
+            "Monthly_Quota":    "Monthly Quota",
+            "CW_ARR":           "CW ARR",
+            "LTC_Credit":       "LTC Uplift",
+            "Retention_Credit": "Retention",
+            "Complete_Credit":  "Complete",
+            "Total_Credited":   "Total Credited",
+            "CW_Units":         "CW Units",
+            "Pct_to_Linearity": "% to Linearity",
+        }, inplace=True)
+        ld.to_excel(writer, sheet_name="Leader Summary", index=False)
+
+        # ── Sheet 2: Rep Detail ───────────────────────────────────────────────
+        rd = rep_data.copy()
+        rd["Pct_to_Linearity"] = (rd["Pct_to_Linearity"].fillna(0) * 100).round(1)
+        rd = rd[["Rep","Leader","Segment","Region","Monthly_Quota","CW_ARR","LTC_Credit",
+                  "Retention_Credit","Complete_Credit","Total_Credited",
+                  "CW_Units","Pct_to_Linearity"]].copy()
+        rd.rename(columns={
+            "Monthly_Quota":    "Monthly Quota",
+            "CW_ARR":           "CW ARR",
+            "LTC_Credit":       "LTC Uplift",
+            "Retention_Credit": "Retention",
+            "Complete_Credit":  "Complete",
+            "Total_Credited":   "Total Credited",
+            "CW_Units":         "CW Units",
+            "Pct_to_Linearity": "% to Linearity",
+        }, inplace=True)
+        rd.to_excel(writer, sheet_name="Rep Detail", index=False)
+
+        # ── Sheet 3: Segment Summary ──────────────────────────────────────────
+        sd2 = seg_data[seg_data["Segment"].isin(["Key","Premier","Strategic"])].copy()
+        sd2["Pct_to_PL"]  = (sd2["Pct_to_PL"].fillna(0)  * 100).round(1)
+        sd2["Pct_to_Lin"] = (sd2["Pct_to_Lin"].fillna(0) * 100).round(1)
+        sd2 = sd2[["Segment","CW_ARR","LTC_Credit","Retention_Credit","Complete_Credit",
+                    "Total_Credited","PL_Quota","Lin_Target",
+                    "Pct_to_PL","Pct_to_Lin","CW_Units"]].copy()
+        sd2.rename(columns={
+            "CW_ARR":           "CW ARR",
+            "LTC_Credit":       "LTC Uplift",
+            "Retention_Credit": "Retention",
+            "Complete_Credit":  "Complete",
+            "Total_Credited":   "Total Credited",
+            "PL_Quota":         "P&L Quota",
+            "Lin_Target":       "Linearity Target",
+            "Pct_to_PL":        "% to P&L",
+            "Pct_to_Lin":       "% to Linearity",
+            "CW_Units":         "CW Units",
+        }, inplace=True)
+        sd2.to_excel(writer, sheet_name="Segment Summary", index=False)
+
+    buf.seek(0)
+    return buf.getvalue()
+
+_safe_label = re.sub(r"[^\w\-]", "_", period_label.replace("|","").replace(" ","_").strip())
+_excel_file  = f"SMB_ClientSales_{_safe_label}.xlsx"
+_excel_bytes = _build_leader_excel(ldr_filtered, rep_filtered, seg_df, period_label)
+
+st.download_button(
+    label="Download Excel",
+    data=_excel_bytes,
+    file_name=_excel_file,
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    help="Downloads Leader Summary, Rep Detail, and Segment Summary for the current filter selection.",
+)
 
 # ── Footer ─────────────────────────────────────────────────────────────────
 row_counts = org.get("Row_Counts", {})
