@@ -67,6 +67,30 @@ NAME_MAP = {
 }
 DEFAULT_TARGETS = Path(__file__).parent / "targets_2026.xlsx"
 
+# Pro-rated quota periods for mid-year hires and team transfers (FY 2026).
+# Derived from GTM Ops Plan Summary Concur.xlsx cross-referenced with targets_2026.xlsx.
+# Rule: start day 1–15 → quota starts same month; 16–31 → quota starts following month.
+# Format: rep_name (un-normalized) -> [(segment, first_quota_month, last_quota_month), ...]
+# Reps with a full Jan 1 assignment and no transfer are NOT listed (no override needed).
+PRORATED_PERIODS = {
+    # ── Same-team moves (were outside SMB CS before start date) ──────────────
+    "Jacob Nickoloff":     [("Key",       2, 12)],   # Jan 20 → starts Feb
+    "Adam Sala":           [("Premier",   2, 12)],   # Jan 20 → starts Feb
+    "Lindsay Wilson":      [("Premier",   2, 12)],   # Feb  1 → starts Feb
+    # ── Cross-segment transfers ───────────────────────────────────────────────
+    "Ashley McCue":        [("Strategic", 1,  3),    # Jan–Mar in Strategic
+                            ("Premier",   4, 12)],   # Apr–Dec in Premier (moved Apr 1)
+    "Jill Desjardine":     [("Key",       1,  5),    # Jan–May in Key
+                            ("Strategic", 6, 12)],   # Jun–Dec in Strategic (moved Jun 1)
+    "Kylie Barrett":       [("Key",       1,  8),    # Jan–Aug in Key
+                            ("Strategic", 9, 12)],   # Sep–Dec in Strategic (moved Sep 1)
+    # ── New hires ─────────────────────────────────────────────────────────────
+    "Joel Segall":         [("Strategic", 5, 12)],   # May  4 → starts May
+    "Nicole Breitenstein": [("Strategic", 5, 12)],   # Apr 20 → starts May
+    "Jon Salmon":          [("Premier",   8, 12)],   # Aug  1 → starts Aug
+    "Tom Osterberg":       [("Strategic", 9, 12)],   # Sep  1 → starts Sep
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CSS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -653,6 +677,58 @@ QUARTER_OF = {1:("Q1",0),2:("Q1",1),3:("Q1",2),
 QLIN_COL   = {"Q1":2,"Q2":3,"Q3":4,"Q4":5}
 MLIN_COL   = {0:6, 1:7, 2:8}
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PRO-RATED QUOTA OVERRIDES
+# ─────────────────────────────────────────────────────────────────────────────
+_ALL_MONTHS = ["January","February","March","April","May","June",
+               "July","August","September","October","November","December"]
+
+
+def build_quota_overrides(tgt_bytes, month_nums):
+    """Return rep_quota_override dict: rep_name (normalized) -> period quota $.
+
+    Uses PRORATED_PERIODS (hardcoded above) to determine which segment monthly
+    amounts to include for each affected rep.  For each rep in PRORATED_PERIODS
+    the function sums the CSE monthly dollar quota for every (segment, month)
+    pair where the month falls within one of the rep's active periods AND within
+    month_nums.  All other reps continue to use IC_Quota * monthly_factor.
+    """
+    if isinstance(month_nums, int):
+        month_nums = [month_nums]
+
+    if tgt_bytes is None or not PRORATED_PERIODS:
+        return {}
+
+    # ── CSE per-segment monthly dollar quotas from targets file ──────────────
+    cse_buf = io.BytesIO(tgt_bytes)
+    cse_raw = pd.read_excel(cse_buf, sheet_name="CSE Quotas with Linearity", header=None)
+    # Row 4 = header with month names; rows 5/6/7 = Key/Strategic/Premier
+    hdr = cse_raw.iloc[4].tolist()
+    try:
+        mid = {m: hdr.index(m) for m in _ALL_MONTHS}
+    except ValueError:
+        return {}   # sheet layout changed — skip overrides gracefully
+
+    seg_monthly = {}
+    for seg, ridx in [("Key", 5), ("Strategic", 6), ("Premier", 7)]:
+        row = cse_raw.iloc[ridx]
+        seg_monthly[seg] = {m: float(row.iloc[mid[m]]) for m in _ALL_MONTHS}
+
+    # ── Build override per rep ────────────────────────────────────────────────
+    override = {}
+    for raw_name, periods in PRORATED_PERIODS.items():
+        nm = normalize(raw_name)
+        period_q = 0.0
+        for (seg, mo_start, mo_end) in periods:
+            if seg not in seg_monthly:
+                continue
+            for m in month_nums:
+                if mo_start <= m <= mo_end:
+                    period_q += seg_monthly[seg][_ALL_MONTHS[m - 1]]
+        override[nm] = period_q
+
+    return override
+
 def load_quotas(tgt_bytes, month_nums):
     """Return (ldr_quota_map, rep_quota_map, rep_leader_map, rep_team_map,
                seg_pl_map, monthly_factor).
@@ -771,7 +847,9 @@ def _assign_leader(df, region_leader_map, mgr_col, rep_leader_map):
 def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
              ldr_quota_map, rep_quota_map, rep_leader_map, rep_team_map,
              seg_pl, month_nums, year, monthly_factor=0.066687,
-             region_leader_map=None):
+             region_leader_map=None, rep_quota_override=None):
+    if rep_quota_override is None:
+        rep_quota_override = {}
     if isinstance(month_nums, int):
         month_nums = [month_nums]
     month_names = [MONTH_NAMES[m - 1] for m in month_nums]
@@ -990,7 +1068,8 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
     rep_grp["Total_Credited"] = (rep_grp["CW_ARR"] + rep_grp["LTC_Credit"]
                                  + rep_grp["Retention_Credit"] + rep_grp["Complete_Credit"])
     rep_grp["Monthly_Quota"] = pd.to_numeric(
-        rep_grp["Rep"].map(lambda r: rep_quota_map.get(r, 0) * monthly_factor),
+        rep_grp["Rep"].map(lambda r: rep_quota_override.get(r,
+            rep_quota_map.get(r, 0) * monthly_factor)),
         errors="coerce").fillna(0)
     rep_grp["Pct_to_Linearity"] = np.where(
         rep_grp["Monthly_Quota"] > 0,
@@ -1071,7 +1150,8 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
 # ─────────────────────────────────────────────────────────────────────────────
 for k, v in [("sf", None), ("data", None), ("last_run", None),
               ("raw_cw", None), ("raw_ltc", None), ("raw_ret", None), ("raw_comp", None),
-              ("tgt_bytes", None), ("monthly_factor", None), ("region_leader_map", {})]:
+              ("tgt_bytes", None),
+              ("monthly_factor", None), ("region_leader_map", {})]:
     if k not in st.session_state:
         st.session_state[k] = v
 
@@ -1260,6 +1340,14 @@ with st.sidebar:
                         st.session_state.tgt_bytes, month_nums)
                     st.session_state.monthly_factor = mf
 
+                    # Build pro-rated quota overrides (mid-year hires / transfers)
+                    rq_override = {}
+                    try:
+                        rq_override = build_quota_overrides(
+                            st.session_state.tgt_bytes, month_nums)
+                    except Exception as _ov_err:
+                        st.warning(f"Pro-rated quota calculation skipped: {_ov_err}")
+
                     # Build live Region → Leader map from the full CW ARR
                     # dataset just fetched.  Uses most-recent-month deals per
                     # region so it always reflects the current org structure.
@@ -1271,7 +1359,8 @@ with st.sidebar:
                         st.session_state.raw_ret, st.session_state.raw_comp,
                         lq, rq, rlm, rtm, sp, month_nums, int(sel_year),
                         monthly_factor=mf,
-                        region_leader_map=rlm_region)
+                        region_leader_map=rlm_region,
+                        rep_quota_override=rq_override)
                     st.session_state.data     = result
                     st.session_state.last_run = datetime.now()
                 except Exception as e:
