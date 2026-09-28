@@ -6,7 +6,7 @@ engine, and renders an interactive monthly performance dashboard.
 Run:  streamlit run dashboard_sfdc.py
 """
 
-import io, json, re, time as _time, warnings
+import io, json, re, threading, time as _time, warnings
 from calendar import monthrange
 from datetime import datetime
 from pathlib import Path
@@ -644,6 +644,96 @@ def sf_run_report_multi(sf, report_id, month_nums, year, full_year=False):
             f"each month call returned the same dataset)"
         )
     return combined, len(combined)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONCURRENCY CONTROL + SHARED REPORT CACHE
+# ─────────────────────────────────────────────────────────────────────────────
+# _sfdc_cache     : in-memory result store, shared across all user sessions
+# _sfdc_key_locks : one Lock per cache key; different periods don't block each
+#                   other but concurrent requests for the same period serialize
+# _sfdc_meta_lock : protects the key-lock registry itself
+_sfdc_cache      = {}
+_sfdc_key_locks  = {}
+_sfdc_meta_lock  = threading.Lock()
+_CACHE_TTL       = 1800              # seconds (30 minutes)
+
+
+def _cache_get(key):
+    """Return cached result if present and not expired, else None."""
+    entry = _sfdc_cache.get(key)
+    if entry and (_time.time() - entry[0]) < _CACHE_TTL:
+        return entry[1]
+    return None
+
+
+def _key_lock(key):
+    """Return (creating if needed) the per-key Lock for this cache entry."""
+    with _sfdc_meta_lock:
+        if key not in _sfdc_key_locks:
+            _sfdc_key_locks[key] = threading.Lock()
+        return _sfdc_key_locks[key]
+
+
+def fetch_all_reports(_sf, rpt_cw, rpt_ltc, rpt_ret, rpt_comp,
+                      month_nums_tuple, year):
+    """Fetch all 4 SFDC reports using double-checked locking.
+
+    Fast path  (cache warm):
+        Returns in milliseconds.  No SFDC call.  No lock acquired.
+
+    Slow path  (cache cold or expired):
+        Acquires a per-key lock.  Any other thread requesting the same period
+        blocks here.  When it unblocks, the second cache check finds the result
+        already populated and returns it without touching Salesforce.
+
+    Result: exactly one SFDC fetch per period per 30-minute window,
+    regardless of how many users click Run Reports simultaneously or how
+    closely together they click.
+    """
+    key = (rpt_cw, rpt_ltc, rpt_ret, rpt_comp, month_nums_tuple, year)
+
+    # ── First check — no lock, instant ──────────────────────────────────────
+    result = _cache_get(key)
+    if result is not None:
+        return result
+
+    # ── Cache miss: serialize on the per-key lock ────────────────────────────
+    with _key_lock(key):
+        # Second check: the previous lock-holder may have just finished fetching.
+        result = _cache_get(key)
+        if result is not None:
+            return result                   # warm — skip fetch entirely
+
+        # This thread is the designated fetcher for this period.
+        month_nums = list(month_nums_tuple)
+        cw_df,  n1 = sf_run_report_multi(_sf, rpt_cw,   month_nums, year)
+        ltc_df, n2 = sf_run_report_multi(_sf, rpt_ltc,  month_nums, year)
+        # Retention: full-year call so standalone deals (prior-month close /
+        # current-month FMC recognition) are not dropped by a tight range.
+        ret_df, n3 = sf_run_report_multi(_sf, rpt_ret,  month_nums, year,
+                                         full_year=True)
+        comp_df,n4 = sf_run_report_multi(_sf, rpt_comp, month_nums, year)
+        result = (cw_df, n1, ltc_df, n2, ret_df, n3, comp_df, n4)
+        _sfdc_cache[key] = (_time.time(), result)
+
+    return result
+
+
+def _sfdc_error_msg(e):
+    """Return a user-friendly string for common Salesforce API errors."""
+    s = str(e)
+    if any(x in s for x in ["INVALID_SESSION_ID", "INVALID_AUTH_HEADER",
+                              "Session expired", "expired session"]):
+        return ("session_expired",
+                "Your Salesforce session has expired. "
+                "Paste a fresh Session ID in the sidebar and click Connect.")
+    if any(x in s for x in ["EXCEEDED_MAX_CONCURRENT", "REQUEST_LIMIT_EXCEEDED",
+                              "TXN_SECURITY_METERING", "concurrent"]):
+        return ("rate_limit",
+                "Salesforce is handling too many requests right now. "
+                "Wait 30 seconds and click Run Reports again.")
+    return ("other", f"Salesforce error: {e}")
 
 
 def _cell_val(cell):
@@ -1314,19 +1404,18 @@ with st.sidebar:
             st.error("Please upload the Quota Targets file.")
         else:
             n_months = len(month_nums)
-            with st.spinner(f"Running Salesforce reports… ({n_months} month{'s' if n_months>1 else ''})"):
+            sf   = st.session_state.sf
+            _yr  = int(sel_year)
+            with st.spinner(
+                f"Running Salesforce reports… ({n_months} month{'s' if n_months>1 else ''})"
+                " — serving from cache or queuing a new fetch"
+            ):
                 try:
-                    sf   = st.session_state.sf
-                    _yr  = int(sel_year)
+                    (cw_df, n1, ltc_df, n2,
+                     ret_df, n3, comp_df, n4) = fetch_all_reports(
+                        sf, rpt_cw, rpt_ltc, rpt_ret, rpt_comp,
+                        tuple(month_nums), _yr)
 
-                    cw_df,  n1 = sf_run_report_multi(sf, rpt_cw,   month_nums, _yr)
-                    ltc_df, n2 = sf_run_report_multi(sf, rpt_ltc,  month_nums, _yr)
-                    # Retention: full-year call so standalone deals (prior-month
-                    # close / current-month FMC recognition) are not dropped by a
-                    # tight month-range filter.  Python's FMC filter scopes months.
-                    ret_df, n3 = sf_run_report_multi(sf, rpt_ret,  month_nums, _yr,
-                                                     full_year=True)
-                    comp_df,n4 = sf_run_report_multi(sf, rpt_comp, month_nums, _yr)
                     st.session_state.raw_cw   = cw_df
                     st.session_state.raw_ltc  = ltc_df
                     st.session_state.raw_ret  = ret_df
@@ -1355,7 +1444,11 @@ with st.sidebar:
                             f"the report's date filter.")
 
                 except Exception as e:
-                    st.error(f"Report error: {e}")
+                    kind, msg = _sfdc_error_msg(e)
+                    if kind == "rate_limit":
+                        st.warning(f"**{msg}**")
+                    else:
+                        st.error(f"**{msg}**")
                     st.stop()
 
             with st.spinner("Calculating metrics…"):
