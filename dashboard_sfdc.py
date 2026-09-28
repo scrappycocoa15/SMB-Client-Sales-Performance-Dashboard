@@ -877,10 +877,13 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
     # Closed is a text picklist), so the API may return ALL-TIME records.
     # The field stores just the month name ("June", no year) on some orgs.
     # Without a year check, isin(["June"]) would match June 2025 AND June 2026,
-    # inflating retention by ~$300k.  We accept three formats:
+    # inflating retention by ~$300k.  We accept four formats:
     #   1. "June 2026"  — explicit month-year (most reliable)
     #   2. "June"       — month only, validated against Close Date year
     #   3. "Jun 2026" / "Jun-2026" — short-month variants
+    #   4. blank/null   — Fall back to Close Date month+year.  Some SFDC orgs
+    #                     leave Final Month Closed unpopulated; without this
+    #                     fallback those records are silently excluded.
     _fmc = ret["Final Month Closed"].fillna("").astype(str).str.strip()
     _month_year_explicit = [f"{mn} {year}" for mn in month_names]          # ["June 2026"]
     _month_year_short    = [f"{mn[:3]} {year}" for mn in month_names]       # ["Jun 2026"]
@@ -892,8 +895,14 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
     # caused all rows to be dropped.  Guard with an explicit column check instead.
     _match_explicit = _fmc.isin(_month_year_explicit + _month_year_short + _month_year_hyphen)
     if "Close Date" in ret.columns:
-        _close_yr     = pd.to_datetime(ret["Close Date"], errors="coerce").dt.year
+        _close_dt  = pd.to_datetime(ret["Close Date"], errors="coerce")
+        _close_yr  = _close_dt.dt.year
+        _close_mo  = _close_dt.dt.month
         _match_month_only = _fmc.isin(_month_only) & _close_yr.eq(year).fillna(False)
+        # Fallback: blank Final Month Closed → use Close Date month and year
+        _match_blank_fmc  = (_fmc.eq("") &
+                              _close_yr.eq(year).fillna(False) &
+                              _close_mo.isin(month_nums).fillna(False))
     else:
         # Close Date not in the Retention report — cannot do year cross-validation.
         # The API was called with a full-year (Jan–Dec year) range, so any rows
@@ -902,7 +911,8 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
         # To enable strict year validation, add a "Close Date" column to the
         # Salesforce Retention report and re-run.
         _match_month_only = _fmc.isin(_month_only)
-    ret = ret[_match_explicit | _match_month_only].copy()
+        _match_blank_fmc  = pd.Series(False, index=ret.index)
+    ret = ret[_match_explicit | _match_month_only | _match_blank_fmc].copy()
     ret["Opportunity Owner"] = ret["Opportunity Owner"].apply(normalize)
     mgr_col_ret = "Oppty Manager" if "Oppty Manager" in ret.columns else "Opportunity Owner: Manager"
     ret[mgr_col_ret] = ret[mgr_col_ret].apply(normalize)
@@ -920,21 +930,33 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
     # and filter on year + month.  The broken v16 approach used str.contains on
     # the digit "6" which matched "2026" itself, letting all 12 months of 2026
     # through and inflating the Complete total.
-    comp["_cm_parsed"] = pd.to_datetime(
-        comp["Close Month"].astype(str).str.strip(), errors="coerce", dayfirst=False)
-    comp = comp[(comp["_cm_parsed"].dt.year  == year) &
-                (comp["_cm_parsed"].dt.month.isin(month_nums))].copy()
-    comp.drop(columns=["_cm_parsed"], inplace=True)
-    comp["Opportunity Owner"] = comp["Opportunity Owner"].apply(normalize)
-    comp["Complete_Credit_Val"] = pd.to_numeric(
-        comp["Roll-up Sales Credit Calculation (converted)"], errors="coerce").fillna(0)
+    #
+    # Guard: if the report returned 0 rows the DataFrame has no columns at all.
+    # Accessing comp["Close Month"] would raise KeyError and crash the entire
+    # run.  Detect this early and substitute an empty frame so the engine
+    # continues with Complete credit = $0 for the period.
+    if comp.empty or "Close Month" not in comp.columns:
+        comp = pd.DataFrame(columns=["Opportunity Owner", "Opportunity Name",
+                                      "Complete_Credit_Val"])
+        comp["Complete_Credit_Val"] = pd.Series(dtype=float)
+    else:
+        comp["_cm_parsed"] = pd.to_datetime(
+            comp["Close Month"].astype(str).str.strip(), errors="coerce", dayfirst=False)
+        comp = comp[(comp["_cm_parsed"].dt.year  == year) &
+                    (comp["_cm_parsed"].dt.month.isin(month_nums))].copy()
+        comp.drop(columns=["_cm_parsed"], inplace=True)
+        comp["Opportunity Owner"] = comp["Opportunity Owner"].apply(normalize)
+        comp["Complete_Credit_Val"] = pd.to_numeric(
+            comp["Roll-up Sales Credit Calculation (converted)"], errors="coerce").fillna(0)
 
     # ── Lookup tables ────────────────────────────────────────────────────────
     complete_names  = set(comp["Opportunity Name"].str.strip())
     complete_lookup = dict(zip(comp["Opportunity Name"].str.strip(), comp["Complete_Credit_Val"]))
 
+    _fa_ltc = ("Forecast Amount (converted)" if "Forecast Amount (converted)" in ltc.columns
+               else "Forecast Amount")
     ltc["LTC_Uplift_Calc"] = ltc.apply(
-        lambda r: pd.to_numeric(r["Forecast Amount"], errors="coerce") * ltc_rate(r["Term (no. of months)"]), axis=1)
+        lambda r: pd.to_numeric(r[_fa_ltc], errors="coerce") * ltc_rate(r["Term (no. of months)"]), axis=1)
     ltc_lookup = dict(zip(ltc["Opportunity Name"].str.strip(), ltc["LTC_Uplift_Calc"]))
 
     ret_grp = ret.groupby("Opportunity ID").agg(
@@ -997,7 +1019,9 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
 
     master["Segment"] = master["Region"].apply(seg_from_team)
     master["VP"]      = master["Segment"].map(VP_MAP).fillna("N/A")
-    master["Forecast_Amount_ARR"] = pd.to_numeric(master["Forecast Amount"], errors="coerce").fillna(0)
+    _fa_cw = ("Forecast Amount (converted)" if "Forecast Amount (converted)" in master.columns
+              else "Forecast Amount")
+    master["Forecast_Amount_ARR"] = pd.to_numeric(master[_fa_cw], errors="coerce").fillna(0)
     master["_OppName"] = master["Opportunity Name"].str.strip()
     master["In_Complete"] = master["_OppName"].isin(complete_names).astype(int)
     master["Complete_Credit"]  = master["_OppName"].map(complete_lookup).fillna(0)
