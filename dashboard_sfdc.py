@@ -1127,8 +1127,9 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
     total_ret   = ret_grp["Retention_Credit"].sum()
 
     # ── Rep aggregation ──────────────────────────────────────────────────────
-    # Sort by Close Date so .last() gives the most recent deal's leader/region,
-    # which represents the rep's CURRENT assignment even if they transferred.
+    # Sort by Close Date so .last() gives the most recent deal's leader/region.
+    # Used for the rep table only — the leader table is now aggregated at deal
+    # level (see below) so mid-year transfers are split correctly there.
     master_s = master.sort_values("Close Date", na_position="first")
     cw_by_rep = master_s.groupby("Rep").agg(
         Leader_cw       = ("Leader",          "last"),   # current assignment
@@ -1192,18 +1193,50 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
                         "CW_ARR","LTC_Credit","Retention_Credit","Complete_Credit",
                         "Total_Credited","Monthly_Quota","Pct_to_Linearity","CW_Units"]]
 
-    # ── Leader aggregation ───────────────────────────────────────────────────
-    ldr_grp = rep_grp.groupby("Leader").agg(
+    # ── Leader aggregation (deal-level) ─────────────────────────────────────
+    # Aggregate from master (one row per CW deal) rather than from rep_grp
+    # (one row per rep).  This ensures mid-year transfers are attributed
+    # correctly: each deal is owned by whoever manages the Oppty Region today,
+    # so Ashley McCue's Strategic-era deals flow to the Strategic leader and
+    # her Premier-era deals flow to the Premier leader regardless of which
+    # team she is currently on.  The rep table is unaffected — reps continue
+    # to show under their most-recent-deal leader in the rep view.
+    _ldr_cw = master.groupby("Leader").agg(
         Segment         = ("Segment",          "first"),
         Region          = ("Region",           "first"),
         VP              = ("VP",               "first"),
-        CW_ARR          = ("CW_ARR",           "sum"),
-        LTC_Credit      = ("LTC_Credit",       "sum"),
-        Retention_Credit= ("Retention_Credit", "sum"),
+        CW_ARR          = ("CW_ARR_Adjusted",  "sum"),
+        LTC_Credit      = ("LTC_Uplift",       "sum"),
         Complete_Credit = ("Complete_Credit",  "sum"),
-        Total_Credited  = ("Total_Credited",   "sum"),
-        CW_Units        = ("CW_Units",         "sum"),
+        Retention_CW    = ("Retention_Credit", "sum"),   # matched retention
+        CW_Units        = ("Opportunity Name", "count"),
     ).reset_index()
+
+    # Standalone retention deals (no matching CW deal) — group by deal-level leader
+    _ldr_ret = standalone.groupby("Leader").agg(
+        Retention_Standalone = ("Retention_Credit", "sum"),
+    ).reset_index()
+
+    ldr_grp = _ldr_cw.merge(_ldr_ret, on="Leader", how="outer")
+    for _c in ["CW_ARR", "LTC_Credit", "Complete_Credit", "Retention_CW", "CW_Units"]:
+        ldr_grp[_c] = ldr_grp[_c].fillna(0)
+    ldr_grp["Retention_Standalone"] = ldr_grp["Retention_Standalone"].fillna(0)
+
+    # For leaders who only appear in standalone retention (no CW deals),
+    # Segment/Region/VP will be NaN from the outer merge — fill from static maps.
+    ldr_grp["Segment"] = ldr_grp.apply(
+        lambda r: r["Segment"]
+        if (pd.notna(r.get("Segment")) and
+            str(r.get("Segment", "")).strip() not in ("", "Unknown", "nan"))
+        else LEADER_SEGMENT.get(r["Leader"], "Unknown"), axis=1)
+    ldr_grp["VP"]     = ldr_grp["Segment"].map(VP_MAP).fillna("N/A")
+    ldr_grp["Region"] = ldr_grp["Region"].fillna(ldr_grp["Segment"])
+
+    ldr_grp["Retention_Credit"] = ldr_grp["Retention_CW"] + ldr_grp["Retention_Standalone"]
+    ldr_grp.drop(columns=["Retention_CW", "Retention_Standalone"], inplace=True)
+
+    ldr_grp["Total_Credited"] = (ldr_grp["CW_ARR"] + ldr_grp["LTC_Credit"]
+                                 + ldr_grp["Retention_Credit"] + ldr_grp["Complete_Credit"])
     ldr_grp["Monthly_Quota"] = pd.to_numeric(
         ldr_grp["Leader"].map(lambda l: ldr_quota_map.get(l, 0)),
         errors="coerce").fillna(0)
