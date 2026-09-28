@@ -1288,8 +1288,34 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
         "Row_Counts": {"CW": len(cw), "LTC": len(ltc), "Retention": len(ret), "Complete": len(comp)},
     }
 
+    # ── Deal-level breakdown table ────────────────────────────────────────────
+    _DEAL_COLS = ["Rep","Leader","Region","Segment","Opportunity Name",
+                  "Close Date","CW_ARR","LTC_Credit",
+                  "Retention_Credit","Complete_Credit","Total_Credited"]
+    _opp_cw = master[["Rep","Leader","Region","Segment",
+                       "Opportunity Name","Close Date",
+                       "CW_ARR_Adjusted","LTC_Uplift",
+                       "Retention_Credit","Complete_Credit",
+                       "Total_Credited"]].copy().rename(columns={
+        "CW_ARR_Adjusted": "CW_ARR",
+        "LTC_Uplift":      "LTC_Credit",
+    })
+    # Standalone retention deals (no matching CW deal)
+    _rep_region_map = rep_grp.drop_duplicates("Rep").set_index("Rep")["Region"].to_dict()
+    _rep_seg_map    = rep_grp.drop_duplicates("Rep").set_index("Rep")["Segment"].to_dict()
+    _opp_ret = standalone[["Rep","Leader","OppName","Retention_Credit"]].copy()
+    _opp_ret = _opp_ret.rename(columns={"OppName": "Opportunity Name"})
+    _opp_ret["Region"]          = _opp_ret["Rep"].map(_rep_region_map).fillna("Unknown")
+    _opp_ret["Segment"]         = _opp_ret["Rep"].map(_rep_seg_map).fillna("Unknown")
+    _opp_ret["CW_ARR"]          = 0.0
+    _opp_ret["LTC_Credit"]      = 0.0
+    _opp_ret["Complete_Credit"] = 0.0
+    _opp_ret["Close Date"]      = pd.NaT
+    _opp_ret["Total_Credited"]  = _opp_ret["Retention_Credit"]
+    deals = pd.concat([_opp_cw[_DEAL_COLS], _opp_ret[_DEAL_COLS]], ignore_index=True)
+
     return {"org": org, "segment": seg_grp, "leader": ldr_grp, "rep": rep_grp,
-            "dist": dist, "master": master}
+            "dist": dist, "master": master, "deals": deals}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1302,9 +1328,10 @@ for k, v in [("sf", None), ("data", None), ("last_run", None),
     if k not in st.session_state:
         st.session_state[k] = v
 
-# period_label / sel_region defaults (overwritten by sidebar widgets each run)
+# period_label / sel_region / sel_rep defaults (overwritten by sidebar widgets each run)
 period_label = "—"
 sel_region   = "All Regions"
+sel_rep      = "All Reps"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SIDEBAR
@@ -1540,10 +1567,15 @@ with st.sidebar:
         _rep_reg = _rep_seg[_rep_seg["Region"]==sel_region] if sel_region != "All Regions" else _rep_seg
         ldrs_avail = ["All Leaders"] + sorted(_rep_reg["Leader"].dropna().unique().tolist())
         sel_ldr = st.selectbox("Leader", ldrs_avail)
+
+        _rep_ldr = _rep_reg[_rep_reg["Leader"]==sel_ldr] if sel_ldr != "All Leaders" else _rep_reg
+        reps_avail = ["All Reps"] + sorted(_rep_ldr["Rep"].dropna().unique().tolist())
+        sel_rep = st.selectbox("Rep", reps_avail)
     else:
         sel_seg    = "All Segments"
         sel_region = "All Regions"
         sel_ldr    = "All Leaders"
+        sel_rep    = "All Reps"
 
     if st.session_state.last_run:
         st.caption(f"Last run: {st.session_state.last_run.strftime('%b %d %Y %H:%M')}")
@@ -1588,6 +1620,21 @@ if sel_region != "All Regions":
 if sel_ldr != "All Leaders":
     rep_filtered = rep_filtered[rep_filtered["Leader"]==sel_ldr]
     ldr_filtered = ldr_filtered[ldr_filtered["Leader"]==sel_ldr]
+if sel_rep != "All Reps":
+    rep_filtered = rep_filtered[rep_filtered["Rep"]==sel_rep]
+
+# ── Deal-level filter ────────────────────────────────────────────────────────
+deals_filtered = data.get("deals", pd.DataFrame()).copy()
+if not deals_filtered.empty:
+    if sel_seg != "All Segments":
+        deals_filtered = deals_filtered[deals_filtered["Segment"]==sel_seg]
+    if sel_region != "All Regions":
+        deals_filtered = deals_filtered[deals_filtered["Region"]==sel_region]
+    if sel_ldr != "All Leaders":
+        deals_filtered = deals_filtered[deals_filtered["Leader"]==sel_ldr]
+    if sel_rep != "All Reps":
+        deals_filtered = deals_filtered[deals_filtered["Rep"]==sel_rep]
+    deals_filtered = deals_filtered[deals_filtered["Total_Credited"] > 0].copy()
 
 # ── Header ────────────────────────────────────────────────────────────────────
 st.markdown(
@@ -1829,7 +1876,45 @@ st.dataframe(
     use_container_width=True, height=420,
 )
 
-# ── Row 5: Segment breakdown table ─────────────────────────────────────────
+# ── Row 5: Opportunity Breakdown ─────────────────────────────────────────────
+st.markdown("<div class='sh'>Opportunity Breakdown</div>", unsafe_allow_html=True)
+_auto_expand = (sel_rep != "All Reps")
+with st.expander(
+    f"Deals for: {sel_rep}" if _auto_expand else "Deal-Level Detail — select a Rep filter to focus",
+    expanded=_auto_expand,
+):
+    if deals_filtered.empty:
+        st.info("No credited deals match the current filters.")
+    else:
+        _dt = deals_filtered[["Rep","Opportunity Name","Close Date","Region",
+                              "CW_ARR","LTC_Credit","Retention_Credit",
+                              "Complete_Credit","Total_Credited"]].copy()
+        _dt["Close Date"] = (pd.to_datetime(_dt["Close Date"], errors="coerce")
+                             .dt.strftime("%b %d, %Y").fillna("—"))
+        _dt = _dt.sort_values("Total_Credited", ascending=False)
+        _dt.rename(columns={
+            "CW_ARR":           "CW ARR",
+            "LTC_Credit":       "LTC Uplift",
+            "Retention_Credit": "Retention",
+            "Complete_Credit":  "Complete",
+            "Total_Credited":   "Total Credited",
+        }, inplace=True)
+        _mc = ["CW ARR","LTC Uplift","Retention","Complete","Total Credited"]
+        st.dataframe(
+            _dt.style.format({c: "${:,.0f}" for c in _mc}),
+            use_container_width=True,
+            height=min(450, 38 * len(_dt) + 42),
+            hide_index=True,
+        )
+        # Summary totals beneath the table
+        _c1, _c2, _c3, _c4, _c5 = st.columns(5)
+        _c1.metric("CW ARR",    f"${deals_filtered['CW_ARR'].sum():,.0f}")
+        _c2.metric("LTC",       f"${deals_filtered['LTC_Credit'].sum():,.0f}")
+        _c3.metric("Retention", f"${deals_filtered['Retention_Credit'].sum():,.0f}")
+        _c4.metric("Complete",  f"${deals_filtered['Complete_Credit'].sum():,.0f}")
+        _c5.metric("Total",     f"${deals_filtered['Total_Credited'].sum():,.0f}")
+
+# ── Row 6: Segment breakdown table ─────────────────────────────────────────
 with st.expander("Segment Detail Table"):
     sd = seg_df[seg_df["Segment"].isin(["Key","Premier","Strategic"])][
         ["Segment","Total_Credited","PL_Quota","Pct_to_PL","Lin_Target","Pct_to_Lin","CW_Units"]].copy()
@@ -1843,7 +1928,7 @@ with st.expander("Segment Detail Table"):
          "% to P&L":"{:.1f}%","% to Lin":"{:.1f}%"}),
         use_container_width=True)
 
-# ── Row 6: Leader Excel Download ───────────────────────────────────────────
+# ── Row 7: Leader Excel Download ───────────────────────────────────────────
 st.markdown("<br>", unsafe_allow_html=True)
 st.markdown("<div class='sh'>Leader Report Download</div>", unsafe_allow_html=True)
 
