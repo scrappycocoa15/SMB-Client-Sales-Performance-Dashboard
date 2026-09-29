@@ -1029,9 +1029,27 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
     ret["Opportunity Owner"] = ret["Opportunity Owner"].apply(normalize)
     mgr_col_ret = "Oppty Manager" if "Oppty Manager" in ret.columns else "Opportunity Owner: Manager"
     ret[mgr_col_ret] = ret[mgr_col_ret].apply(normalize)
-    ret["BMI_ARR"]     = pd.to_numeric(ret["BMI Sales ARR"], errors="coerce").fillna(0)
-    ret["Roll_SC_Ret"] = pd.to_numeric(
-        ret["Roll-up Sales Credit Calculation (converted)"], errors="coerce").fillna(0)
+    ret["BMI_ARR"] = pd.to_numeric(ret["BMI Sales ARR"], errors="coerce").fillna(0)
+    # Retention incentive formula (per comp team): MAX(0, BMI Sales ARR − Forecast Amount).
+    # Resolve Forecast Amount: check the retention file first (it may already include the
+    # column); if absent, join from cw_raw by Opportunity ID so standalone retention deals
+    # that have no matching CW row still get a value where possible.
+    _fa_ret = next((c for c in ret.columns if c.lower().startswith("forecast amount")), None)
+    if _fa_ret:
+        _ret_fa_vals = pd.to_numeric(ret[_fa_ret], errors="coerce").fillna(0)
+    elif "Opportunity ID" in ret.columns and "Opportunity ID" in cw_raw.columns:
+        _fa_cw_col = next(
+            (c for c in cw_raw.columns if c.lower().startswith("forecast amount")), None)
+        if _fa_cw_col:
+            _fa_map = dict(zip(
+                cw_raw["Opportunity ID"],
+                pd.to_numeric(cw_raw[_fa_cw_col], errors="coerce")))
+            _ret_fa_vals = ret["Opportunity ID"].map(_fa_map).fillna(0)
+        else:
+            _ret_fa_vals = pd.Series(0.0, index=ret.index)
+    else:
+        _ret_fa_vals = pd.Series(0.0, index=ret.index)
+    ret["Roll_SC_Ret"] = _ret_fa_vals   # alias kept so groupby SC_SUM works unchanged
     split_mask = ret.get("ARR Disputes", pd.Series([""] * len(ret))).fillna("")
     split_mask = split_mask.str.contains("Split Opportunity", case=False, na=False)
     ret = ret[~split_mask].copy()
