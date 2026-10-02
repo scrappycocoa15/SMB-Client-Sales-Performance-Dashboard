@@ -2103,46 +2103,68 @@ st.markdown("<br>", unsafe_allow_html=True)
 st.markdown("<div class='sh'>CW Deal Detail Download</div>", unsafe_allow_html=True)
 st.caption("One row per CW opportunity — includes Account ID, Account Name, Opportunity ID, and all incentive amounts. Respects the current period selection.")
 
-def _build_cw_detail_excel(master_df, period_lbl):
-    """Build a deal-level Excel workbook from the master CW dataset."""
+def _build_cw_detail_excel(deals_df, master_df, period_lbl):
+    """Build a deal-level Excel workbook.
+
+    Uses deals_df as the row source — this includes both CW deals and
+    standalone retention rows, so the Total Credited sum matches the dashboard.
+    ID columns (Account ID, Opportunity ID, Forecast Amount, Opportunity Owner)
+    are joined from master_df by Opportunity Name; standalone retention rows
+    that have no matching CW deal will have blank values for those columns.
+    """
     buf = io.BytesIO()
-    df = master_df.copy()
 
-    # Detect Account ID column (SFDC exports various names)
-    _acct_id_col = next(
-        (c for c in df.columns if c.strip().lower() in (
-            "account id", "account: id (18 char)", "account id (18 char)",
-            "account id (18-char)", "accountid")),
-        None)
-    _acct_name_col = next(
-        (c for c in df.columns if c.strip().lower() in (
-            "account name", "account: name", "accountname")),
-        None)
+    def _find_col(frame, *fragment_groups):
+        """Return first column whose lowercased name contains ALL terms in any group."""
+        for combo in fragment_groups:
+            terms = [t.lower() for t in (combo if isinstance(combo, (list, tuple)) else [combo])]
+            for c in frame.columns:
+                cl = c.strip().lower()
+                if all(t in cl for t in terms):
+                    return c
+        return None
 
-    # Detect opportunity ID column: prefer 18-char field
-    _oid_col = ("ID (18 Char)" if "ID (18 Char)" in df.columns
-                else "Opportunity ID" if "Opportunity ID" in df.columns
-                else None)
+    # ── Columns to pull from master and join onto deals ───────────────────────
+    _acct_id_col   = _find_col(master_df, ["account", "id", "18"], ["account", "id"])
+    if _acct_id_col and "name" in _acct_id_col.lower():
+        _acct_id_col = None
+    _acct_name_col = _find_col(master_df, ["account", "name"])
+    _oid_col       = _find_col(master_df, ["id", "18"], ["opportunity", "id"])
+    _fa_col        = _find_col(master_df, ["forecast", "amount"])
+    _owner_col     = "Opportunity Owner" if "Opportunity Owner" in master_df.columns else None
 
+    join_cols = [c for c in [_acct_id_col, _acct_name_col, _oid_col, _fa_col, _owner_col]
+                 if c and c in master_df.columns and c != "Opportunity Name"]
+    join_cols = list(dict.fromkeys(join_cols))   # deduplicate, preserve order
+
+    # Build lookup frame from master (one row per unique Opportunity Name)
+    if join_cols:
+        _id_frame = (master_df[["Opportunity Name"] + join_cols]
+                     .drop_duplicates("Opportunity Name"))
+        df = deals_df.merge(_id_frame, on="Opportunity Name", how="left")
+    else:
+        df = deals_df.copy()
+
+    # ── Assemble output columns ───────────────────────────────────────────────
     out = pd.DataFrame()
-    out["Account ID"]        = df[_acct_id_col].fillna("")  if _acct_id_col else ""
+    out["Account ID"]        = df[_acct_id_col].fillna("")   if _acct_id_col   else ""
     out["Account Name"]      = df[_acct_name_col].fillna("") if _acct_name_col else ""
-    out["Opportunity ID"]    = df[_oid_col].fillna("")       if _oid_col else ""
+    out["Opportunity ID"]    = df[_oid_col].fillna("")        if _oid_col       else ""
     out["Opportunity Name"]  = df["Opportunity Name"].fillna("")
-    out["Opportunity Owner"] = df["Opportunity Owner"].fillna("")
-    out["Close Date"]        = pd.to_datetime(df["Close Date"], errors="coerce").dt.date
-    out["Rep"]               = df.get("Rep",     df["Opportunity Owner"])
-    out["Leader"]            = df.get("Leader",  "")
-    out["Region"]            = df.get("Region",  "")
-    out["Segment"]           = df.get("Segment", "")
-    out["Forecast Amount"]   = df["Forecast_Amount_ARR"].round(2)
-    out["CW ARR"]            = df["CW_ARR_Adjusted"].round(2)
-    out["LTC Uplift"]        = df["LTC_Uplift"].round(2)
-    out["Retention"]         = df["Retention_Credit"].round(2)
-    out["Complete/Ref"]      = df["Complete_Credit"].round(2)
-    out["Total Credited"]    = df["Total_Credited"].round(2)
-    out["Endorsed App"]      = df.get("Endorsed_App_Flag", 0).astype(int)
-    out["In Complete"]       = df.get("In_Complete", 0).astype(int)
+    out["Opportunity Owner"] = df[_owner_col].fillna("")      if _owner_col     else ""
+    out["Close Date"]        = pd.to_datetime(df.get("Close Date"), errors="coerce").dt.date
+    out["Rep"]               = df["Rep"].fillna("")
+    out["Leader"]            = df["Leader"].fillna("")
+    out["Region"]            = df["Region"].fillna("")
+    out["Segment"]           = df["Segment"].fillna("")
+    _fa_vals = pd.to_numeric(df[_fa_col], errors="coerce").fillna(0) if _fa_col else 0
+    out["Forecast Amount"]   = _fa_vals if isinstance(_fa_vals, pd.Series) else pd.Series(_fa_vals, index=df.index)
+    out["Forecast Amount"]   = out["Forecast Amount"].round(2)
+    out["CW ARR"]            = pd.to_numeric(df["CW_ARR"],          errors="coerce").fillna(0).round(2)
+    out["LTC Uplift"]        = pd.to_numeric(df["LTC_Credit"],       errors="coerce").fillna(0).round(2)
+    out["Retention"]         = pd.to_numeric(df["Retention_Credit"], errors="coerce").fillna(0).round(2)
+    out["Complete/Ref"]      = pd.to_numeric(df["Complete_Credit"],  errors="coerce").fillna(0).round(2)
+    out["Total Credited"]    = pd.to_numeric(df["Total_Credited"],   errors="coerce").fillna(0).round(2)
 
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         out.to_excel(writer, sheet_name="CW Deal Detail", index=False)
@@ -2155,7 +2177,7 @@ def _build_cw_detail_excel(master_df, period_lbl):
     return buf.getvalue()
 
 _cw_detail_file  = f"CW_Deal_Detail_{_safe_label}.xlsx"
-_cw_detail_bytes = _build_cw_detail_excel(data["master"], period_label)
+_cw_detail_bytes = _build_cw_detail_excel(data["deals"], data["master"], period_label)
 
 st.download_button(
     label="Download CW Deal Detail",
