@@ -1099,10 +1099,18 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
         ltc["LTC_Uplift_Calc"] = ltc.apply(
             lambda r: pd.to_numeric(r[_fa_ltc], errors="coerce") * ltc_rate(r["Term (no. of months)"]), axis=1)
         ltc_lookup = dict(zip(ltc[_ltc_id_col].astype(str).str.strip(), ltc["LTC_Uplift_Calc"]))
+        _ltc_id_based = True
+    elif "Opportunity Name" in ltc.columns:
+        # Fallback: no ID column in LTC report — match by name (v4 behaviour)
+        ltc["LTC_Uplift_Calc"] = ltc.apply(
+            lambda r: pd.to_numeric(r[_fa_ltc], errors="coerce") * ltc_rate(r["Term (no. of months)"]), axis=1)
+        ltc_lookup = dict(zip(ltc["Opportunity Name"].str.strip(), ltc["LTC_Uplift_Calc"]))
+        _ltc_id_based = False
     else:
-        # LTC returned no rows or no ID column — no LTC credit this period.
+        # LTC returned no rows — no LTC credit this period.
         ltc["LTC_Uplift_Calc"] = pd.Series(dtype=float)
         ltc_lookup = {}
+        _ltc_id_based = False
 
     ret_grp = ret.groupby("Opportunity ID").agg(
         BMI_SUM  = ("BMI_ARR",     "sum"),
@@ -1194,7 +1202,7 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
         _base_arr  = master["Forecast_Amount_ARR"]
 
     master["CW_ARR_Adjusted"]  = np.where(master["In_Complete"] == 1, 0, _base_arr)
-    if _cw_id_col:
+    if _ltc_id_based and _cw_id_col:
         master["LTC_Uplift"] = master[_cw_id_col].astype(str).str.strip().map(ltc_lookup).fillna(0)
     else:
         master["LTC_Uplift"] = master["_OppName"].map(ltc_lookup).fillna(0)
