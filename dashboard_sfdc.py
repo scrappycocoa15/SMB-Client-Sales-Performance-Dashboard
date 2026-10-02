@@ -946,7 +946,12 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
 
     # ── Filter by period ─────────────────────────────────────────────────────
     cw = cw_raw.copy()
-    cw.rename(columns={"ID (18 Char)": "Opportunity ID"}, inplace=True)
+    # Detect 18-char opportunity ID column. SFDC reports may export both
+    # "Opportunity ID" (15-char standard field) and "ID (18 Char)" (18-char).
+    # Using "ID (18 Char)" when present avoids duplicate-column issues.
+    _cw_id_col = ("ID (18 Char)" if "ID (18 Char)" in cw.columns
+                  else "Opportunity ID" if "Opportunity ID" in cw.columns
+                  else None)
     # Guard: if CW report returns 0 rows (column-less DataFrame), ensure
     # required columns exist so downstream master-dataset logic completes cleanly.
     if "Close Date" in cw.columns:
@@ -958,12 +963,14 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
     mgr_col_cw = "Oppty Manager" if "Oppty Manager" in cw.columns else "Opportunity Owner: Manager"
     if mgr_col_cw in cw.columns:
         cw[mgr_col_cw] = cw[mgr_col_cw].apply(normalize)
-    for _col in ["Opportunity Owner", "Opportunity Name", "Opportunity ID", "Close Date"]:
+    for _col in ["Opportunity Owner", "Opportunity Name", "Close Date"]:
         if _col not in cw.columns:
             cw[_col] = pd.Series(dtype=object)
 
     ltc = ltc_raw.copy()
-    ltc.rename(columns={"ID (18 Char)": "Opportunity ID"}, inplace=True)
+    _ltc_id_col = ("ID (18 Char)" if "ID (18 Char)" in ltc.columns
+                   else "Opportunity ID" if "Opportunity ID" in ltc.columns
+                   else None)
     # Guard: LTC report may return 0 rows (e.g. SFDC date filter active), producing
     # a column-less DataFrame.  Accessing ltc["Close Date"] on that would raise
     # KeyError and crash the entire calc run.  Mirror the same guard used for comp.
@@ -1088,12 +1095,12 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
 
     _fa_ltc = ("Forecast Amount (converted)" if "Forecast Amount (converted)" in ltc.columns
                else "Forecast Amount")
-    if "Opportunity ID" in ltc.columns:
+    if _ltc_id_col:
         ltc["LTC_Uplift_Calc"] = ltc.apply(
             lambda r: pd.to_numeric(r[_fa_ltc], errors="coerce") * ltc_rate(r["Term (no. of months)"]), axis=1)
-        ltc_lookup = dict(zip(ltc["Opportunity ID"].str.strip(), ltc["LTC_Uplift_Calc"]))
+        ltc_lookup = dict(zip(ltc[_ltc_id_col].astype(str).str.strip(), ltc["LTC_Uplift_Calc"]))
     else:
-        # LTC returned no rows — no LTC credit this period.
+        # LTC returned no rows or no ID column — no LTC credit this period.
         ltc["LTC_Uplift_Calc"] = pd.Series(dtype=float)
         ltc_lookup = {}
 
@@ -1187,7 +1194,10 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
         _base_arr  = master["Forecast_Amount_ARR"]
 
     master["CW_ARR_Adjusted"]  = np.where(master["In_Complete"] == 1, 0, _base_arr)
-    master["LTC_Uplift"]       = master["Opportunity ID"].astype(str).str.strip().map(ltc_lookup).fillna(0)
+    if _cw_id_col:
+        master["LTC_Uplift"] = master[_cw_id_col].astype(str).str.strip().map(ltc_lookup).fillna(0)
+    else:
+        master["LTC_Uplift"] = master["_OppName"].map(ltc_lookup).fillna(0)
     master["Retention_Credit"] = master["_OppName"].map(ret_by_oppname).fillna(0)
     master["Total_Credited"]   = (master["CW_ARR_Adjusted"] + master["LTC_Uplift"]
                                   + master["Retention_Credit"] + master["Complete_Credit"])
@@ -2083,15 +2093,14 @@ st.download_button(
 # ── CW Deal Detail Download ─────────────────────────────────────────────────
 st.markdown("<br>", unsafe_allow_html=True)
 st.markdown("<div class='sh'>CW Deal Detail Download</div>", unsafe_allow_html=True)
-st.caption("One row per CW opportunity — includes Account ID, Account Name, Opportunity ID, incentive amounts. Respects current period and filter selection.")
+st.caption("One row per CW opportunity — includes Account ID, Account Name, Opportunity ID, and all incentive amounts. Respects the current period selection.")
 
 def _build_cw_detail_excel(master_df, period_lbl):
     """Build a deal-level Excel workbook from the master CW dataset."""
     buf = io.BytesIO()
-
     df = master_df.copy()
 
-    # ── Detect Account ID column (SFDC exports various names) ────────────────
+    # Detect Account ID column (SFDC exports various names)
     _acct_id_col = next(
         (c for c in df.columns if c.strip().lower() in (
             "account id", "account: id (18 char)", "account id (18 char)",
@@ -2102,11 +2111,15 @@ def _build_cw_detail_excel(master_df, period_lbl):
             "account name", "account: name", "accountname")),
         None)
 
-    # ── Build output frame ────────────────────────────────────────────────────
+    # Detect opportunity ID column: prefer 18-char field
+    _oid_col = ("ID (18 Char)" if "ID (18 Char)" in df.columns
+                else "Opportunity ID" if "Opportunity ID" in df.columns
+                else None)
+
     out = pd.DataFrame()
-    out["Account ID"]        = df[_acct_id_col].fillna("") if _acct_id_col else ""
+    out["Account ID"]        = df[_acct_id_col].fillna("")  if _acct_id_col else ""
     out["Account Name"]      = df[_acct_name_col].fillna("") if _acct_name_col else ""
-    out["Opportunity ID"]    = df["Opportunity ID"].fillna("") if "Opportunity ID" in df.columns else ""
+    out["Opportunity ID"]    = df[_oid_col].fillna("")       if _oid_col else ""
     out["Opportunity Name"]  = df["Opportunity Name"].fillna("")
     out["Opportunity Owner"] = df["Opportunity Owner"].fillna("")
     out["Close Date"]        = pd.to_datetime(df["Close Date"], errors="coerce").dt.date
@@ -2126,7 +2139,6 @@ def _build_cw_detail_excel(master_df, period_lbl):
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         out.to_excel(writer, sheet_name="CW Deal Detail", index=False)
         ws = writer.sheets["CW Deal Detail"]
-        # Auto-size columns
         for col_cells in ws.columns:
             max_len = max((len(str(c.value)) if c.value is not None else 0) for c in col_cells)
             ws.column_dimensions[col_cells[0].column_letter].width = min(max_len + 2, 50)
