@@ -946,6 +946,7 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
 
     # ── Filter by period ─────────────────────────────────────────────────────
     cw = cw_raw.copy()
+    cw.rename(columns={"ID (18 Char)": "Opportunity ID"}, inplace=True)
     # Guard: if CW report returns 0 rows (column-less DataFrame), ensure
     # required columns exist so downstream master-dataset logic completes cleanly.
     if "Close Date" in cw.columns:
@@ -957,11 +958,12 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
     mgr_col_cw = "Oppty Manager" if "Oppty Manager" in cw.columns else "Opportunity Owner: Manager"
     if mgr_col_cw in cw.columns:
         cw[mgr_col_cw] = cw[mgr_col_cw].apply(normalize)
-    for _col in ["Opportunity Owner", "Opportunity Name", "Close Date"]:
+    for _col in ["Opportunity Owner", "Opportunity Name", "Opportunity ID", "Close Date"]:
         if _col not in cw.columns:
             cw[_col] = pd.Series(dtype=object)
 
     ltc = ltc_raw.copy()
+    ltc.rename(columns={"ID (18 Char)": "Opportunity ID"}, inplace=True)
     # Guard: LTC report may return 0 rows (e.g. SFDC date filter active), producing
     # a column-less DataFrame.  Accessing ltc["Close Date"] on that would raise
     # KeyError and crash the entire calc run.  Mirror the same guard used for comp.
@@ -1086,10 +1088,10 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
 
     _fa_ltc = ("Forecast Amount (converted)" if "Forecast Amount (converted)" in ltc.columns
                else "Forecast Amount")
-    if "Opportunity Name" in ltc.columns:
+    if "Opportunity ID" in ltc.columns:
         ltc["LTC_Uplift_Calc"] = ltc.apply(
             lambda r: pd.to_numeric(r[_fa_ltc], errors="coerce") * ltc_rate(r["Term (no. of months)"]), axis=1)
-        ltc_lookup = dict(zip(ltc["Opportunity Name"].str.strip(), ltc["LTC_Uplift_Calc"]))
+        ltc_lookup = dict(zip(ltc["Opportunity ID"].str.strip(), ltc["LTC_Uplift_Calc"]))
     else:
         # LTC returned no rows — no LTC credit this period.
         ltc["LTC_Uplift_Calc"] = pd.Series(dtype=float)
@@ -1185,7 +1187,7 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
         _base_arr  = master["Forecast_Amount_ARR"]
 
     master["CW_ARR_Adjusted"]  = np.where(master["In_Complete"] == 1, 0, _base_arr)
-    master["LTC_Uplift"]       = master["_OppName"].map(ltc_lookup).fillna(0)
+    master["LTC_Uplift"]       = master["Opportunity ID"].astype(str).str.strip().map(ltc_lookup).fillna(0)
     master["Retention_Credit"] = master["_OppName"].map(ret_by_oppname).fillna(0)
     master["Total_Credited"]   = (master["CW_ARR_Adjusted"] + master["LTC_Uplift"]
                                   + master["Retention_Credit"] + master["Complete_Credit"])
@@ -2076,6 +2078,71 @@ st.download_button(
     file_name=_excel_file,
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     help="Downloads Leader Summary, Rep Detail, and Segment Summary for the current filter selection.",
+)
+
+# ── CW Deal Detail Download ─────────────────────────────────────────────────
+st.markdown("<br>", unsafe_allow_html=True)
+st.markdown("<div class='sh'>CW Deal Detail Download</div>", unsafe_allow_html=True)
+st.caption("One row per CW opportunity — includes Account ID, Account Name, Opportunity ID, incentive amounts. Respects current period and filter selection.")
+
+def _build_cw_detail_excel(master_df, period_lbl):
+    """Build a deal-level Excel workbook from the master CW dataset."""
+    buf = io.BytesIO()
+
+    df = master_df.copy()
+
+    # ── Detect Account ID column (SFDC exports various names) ────────────────
+    _acct_id_col = next(
+        (c for c in df.columns if c.strip().lower() in (
+            "account id", "account: id (18 char)", "account id (18 char)",
+            "account id (18-char)", "accountid")),
+        None)
+    _acct_name_col = next(
+        (c for c in df.columns if c.strip().lower() in (
+            "account name", "account: name", "accountname")),
+        None)
+
+    # ── Build output frame ────────────────────────────────────────────────────
+    out = pd.DataFrame()
+    out["Account ID"]        = df[_acct_id_col].fillna("") if _acct_id_col else ""
+    out["Account Name"]      = df[_acct_name_col].fillna("") if _acct_name_col else ""
+    out["Opportunity ID"]    = df["Opportunity ID"].fillna("") if "Opportunity ID" in df.columns else ""
+    out["Opportunity Name"]  = df["Opportunity Name"].fillna("")
+    out["Opportunity Owner"] = df["Opportunity Owner"].fillna("")
+    out["Close Date"]        = pd.to_datetime(df["Close Date"], errors="coerce").dt.date
+    out["Rep"]               = df.get("Rep",     df["Opportunity Owner"])
+    out["Leader"]            = df.get("Leader",  "")
+    out["Region"]            = df.get("Region",  "")
+    out["Segment"]           = df.get("Segment", "")
+    out["Forecast Amount"]   = df["Forecast_Amount_ARR"].round(2)
+    out["CW ARR"]            = df["CW_ARR_Adjusted"].round(2)
+    out["LTC Uplift"]        = df["LTC_Uplift"].round(2)
+    out["Retention"]         = df["Retention_Credit"].round(2)
+    out["Complete/Ref"]      = df["Complete_Credit"].round(2)
+    out["Total Credited"]    = df["Total_Credited"].round(2)
+    out["Endorsed App"]      = df.get("Endorsed_App_Flag", 0).astype(int)
+    out["In Complete"]       = df.get("In_Complete", 0).astype(int)
+
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        out.to_excel(writer, sheet_name="CW Deal Detail", index=False)
+        ws = writer.sheets["CW Deal Detail"]
+        # Auto-size columns
+        for col_cells in ws.columns:
+            max_len = max((len(str(c.value)) if c.value is not None else 0) for c in col_cells)
+            ws.column_dimensions[col_cells[0].column_letter].width = min(max_len + 2, 50)
+
+    buf.seek(0)
+    return buf.getvalue()
+
+_cw_detail_file  = f"CW_Deal_Detail_{_safe_label}.xlsx"
+_cw_detail_bytes = _build_cw_detail_excel(data["master"], period_label)
+
+st.download_button(
+    label="Download CW Deal Detail",
+    data=_cw_detail_bytes,
+    file_name=_cw_detail_file,
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    help="One row per CW opportunity with account, opportunity, and all incentive amounts.",
 )
 
 # ── Footer ─────────────────────────────────────────────────────────────────
