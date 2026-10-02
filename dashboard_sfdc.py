@@ -946,7 +946,6 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
 
     # ── Filter by period ─────────────────────────────────────────────────────
     cw = cw_raw.copy()
-    cw.rename(columns={"ID (18 Char)": "Opportunity ID"}, inplace=True)
     # Guard: if CW report returns 0 rows (column-less DataFrame), ensure
     # required columns exist so downstream master-dataset logic completes cleanly.
     if "Close Date" in cw.columns:
@@ -958,12 +957,11 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
     mgr_col_cw = "Oppty Manager" if "Oppty Manager" in cw.columns else "Opportunity Owner: Manager"
     if mgr_col_cw in cw.columns:
         cw[mgr_col_cw] = cw[mgr_col_cw].apply(normalize)
-    for _col in ["Opportunity Owner", "Opportunity Name", "Opportunity ID", "Close Date"]:
+    for _col in ["Opportunity Owner", "Opportunity Name", "Close Date"]:
         if _col not in cw.columns:
             cw[_col] = pd.Series(dtype=object)
 
     ltc = ltc_raw.copy()
-    ltc.rename(columns={"ID (18 Char)": "Opportunity ID"}, inplace=True)
     # Guard: LTC report may return 0 rows (e.g. SFDC date filter active), producing
     # a column-less DataFrame.  Accessing ltc["Close Date"] on that would raise
     # KeyError and crash the entire calc run.  Mirror the same guard used for comp.
@@ -978,7 +976,6 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
         ltc[mgr_col_ltc] = ltc[mgr_col_ltc].apply(normalize)
 
     ret = ret_raw.copy()
-    ret.rename(columns={"ID (18 Char)": "Opportunity ID"}, inplace=True)
     # Guard: if Retention report returns 0 rows (column-less DataFrame), pre-populate
     # all columns the downstream logic touches so no KeyError is raised.
     # The FMC filter, groupby, and merge will all produce empty results cleanly.
@@ -1058,7 +1055,6 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
     ret = ret[~split_mask].copy()
 
     comp = comp_raw.copy()
-    comp.rename(columns={"ID (18 Char)": "Opportunity ID"}, inplace=True)
     # ── Close Month filter ──────────────────────────────────────────────────
     # Close Month is a date formula field; the Analytics API returns ISO format
     # ("2026-06-01") or parseable text ("June 2026").  Parse with pd.to_datetime
@@ -1072,7 +1068,7 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
     # continues with Complete credit = $0 for the period.
     if comp.empty or "Close Month" not in comp.columns:
         comp = pd.DataFrame(columns=["Opportunity Owner", "Opportunity Name",
-                                      "Opportunity ID", "Complete_Credit_Val"])
+                                      "Complete_Credit_Val"])
         comp["Complete_Credit_Val"] = pd.Series(dtype=float)
     else:
         comp["_cm_parsed"] = pd.to_datetime(
@@ -1083,19 +1079,17 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
         comp["Opportunity Owner"] = comp["Opportunity Owner"].apply(normalize)
         comp["Complete_Credit_Val"] = pd.to_numeric(
             comp["Roll-up Sales Credit Calculation (converted)"], errors="coerce").fillna(0)
-        if "Opportunity ID" not in comp.columns:
-            comp["Opportunity ID"] = pd.Series(dtype=object)
 
     # ── Lookup tables ────────────────────────────────────────────────────────
-    complete_ids    = set(comp["Opportunity ID"].str.strip())
-    complete_lookup = dict(zip(comp["Opportunity ID"].str.strip(), comp["Complete_Credit_Val"]))
+    complete_names  = set(comp["Opportunity Name"].str.strip())
+    complete_lookup = dict(zip(comp["Opportunity Name"].str.strip(), comp["Complete_Credit_Val"]))
 
     _fa_ltc = ("Forecast Amount (converted)" if "Forecast Amount (converted)" in ltc.columns
                else "Forecast Amount")
-    if "Opportunity ID" in ltc.columns:
+    if "Opportunity Name" in ltc.columns:
         ltc["LTC_Uplift_Calc"] = ltc.apply(
             lambda r: pd.to_numeric(r[_fa_ltc], errors="coerce") * ltc_rate(r["Term (no. of months)"]), axis=1)
-        ltc_lookup = dict(zip(ltc["Opportunity ID"].str.strip(), ltc["LTC_Uplift_Calc"]))
+        ltc_lookup = dict(zip(ltc["Opportunity Name"].str.strip(), ltc["LTC_Uplift_Calc"]))
     else:
         # LTC returned no rows — no LTC credit this period.
         ltc["LTC_Uplift_Calc"] = pd.Series(dtype=float)
@@ -1137,7 +1131,7 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
     ret_grp["Leader"] = _assign_leader(_rg, region_leader_map,
                                        mgr_col_ret, rep_leader_map).values
 
-    ret_by_id = ret_grp.groupby("Opportunity ID")["Retention_Credit"].sum().to_dict()
+    ret_by_oppname = ret_grp.groupby("OppName")["Retention_Credit"].sum().to_dict()
 
     # ── Master dataset ───────────────────────────────────────────────────────
     master = cw.copy()
@@ -1165,9 +1159,8 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
               else "Forecast Amount")
     master["Forecast_Amount_ARR"] = pd.to_numeric(master[_fa_cw], errors="coerce").fillna(0)
     master["_OppName"] = master["Opportunity Name"].str.strip()
-    master["_OppID"]   = master["Opportunity ID"].astype(str).str.strip()
-    master["In_Complete"]      = master["_OppID"].isin(complete_ids).astype(int)
-    master["Complete_Credit"]  = master["_OppID"].map(complete_lookup).fillna(0)
+    master["In_Complete"] = master["_OppName"].isin(complete_names).astype(int)
+    master["Complete_Credit"]  = master["_OppName"].map(complete_lookup).fillna(0)
 
     # ── Endorsed App CW ARR override ─────────────────────────────────────────
     # Endorsed App deals (partner contracts via Motus, Blue Dot, etc.) have two
@@ -1192,14 +1185,14 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
         _base_arr  = master["Forecast_Amount_ARR"]
 
     master["CW_ARR_Adjusted"]  = np.where(master["In_Complete"] == 1, 0, _base_arr)
-    master["LTC_Uplift"]       = master["_OppID"].map(ltc_lookup).fillna(0)
-    master["Retention_Credit"] = master["_OppID"].map(ret_by_id).fillna(0)
+    master["LTC_Uplift"]       = master["_OppName"].map(ltc_lookup).fillna(0)
+    master["Retention_Credit"] = master["_OppName"].map(ret_by_oppname).fillna(0)
     master["Total_Credited"]   = (master["CW_ARR_Adjusted"] + master["LTC_Uplift"]
                                   + master["Retention_Credit"] + master["Complete_Credit"])
 
     # ── Standalone retention (not matched to CW) ─────────────────────────────
-    cw_ids      = set(master["_OppID"])
-    standalone  = ret_grp[~ret_grp["Opportunity ID"].isin(cw_ids)]
+    cw_names    = set(master["_OppName"])
+    standalone  = ret_grp[~ret_grp["OppName"].isin(cw_names)]
     total_ret   = ret_grp["Retention_Credit"].sum()
 
     # ── Rep aggregation ──────────────────────────────────────────────────────
@@ -2083,77 +2076,6 @@ st.download_button(
     file_name=_excel_file,
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     help="Downloads Leader Summary, Rep Detail, and Segment Summary for the current filter selection.",
-)
-
-# ── CW Deal Detail Download ─────────────────────────────────────────────────
-def _build_cw_detail_excel(master_df, period_lbl):
-    """Deal-level workbook: one row per CW opportunity with account and
-    incentive columns for account-level analysis."""
-
-    # Detect account ID column — SFDC may export as 'Account ID',
-    # 'Account: ID (18 Char)', or 'Account ID (18 Char)'
-    _acct_id_col = next(
-        (c for c in master_df.columns
-         if c.strip().lower() in ("account id", "account: id (18 char)", "account id (18 char)")),
-        None)
-
-    # Detect account name column
-    _acct_name_col = next(
-        (c for c in master_df.columns
-         if c.strip().lower() in ("account name", "account: name")),
-        None)
-
-    df = master_df.copy()
-
-    # Build the output columns, gracefully handling missing account fields
-    out = pd.DataFrame()
-    out["Account ID"]        = df[_acct_id_col].astype(str).str.strip() if _acct_id_col else ""
-    out["Account Name"]      = df[_acct_name_col].astype(str).str.strip() if _acct_name_col else ""
-    out["Opportunity ID"]    = df["Opportunity ID"].astype(str).str.strip() if "Opportunity ID" in df.columns else ""
-    out["Opportunity Name"]  = df["Opportunity Name"].astype(str).str.strip()
-    out["Opportunity Owner"] = df["Opportunity Owner"].astype(str).str.strip()
-    out["Close Date"]        = pd.to_datetime(df["Close Date"], errors="coerce").dt.strftime("%Y-%m-%d")
-    out["Rep"]               = df["Rep"].astype(str).str.strip()
-    out["Leader"]            = df["Leader"].astype(str).str.strip()
-    out["Region"]            = df["Region"].astype(str).str.strip()
-    out["Segment"]           = df["Segment"].astype(str).str.strip()
-    out["Forecast Amount"]   = pd.to_numeric(df["Forecast_Amount_ARR"], errors="coerce").fillna(0).round(2)
-    out["CW ARR"]            = pd.to_numeric(df["CW_ARR_Adjusted"],     errors="coerce").fillna(0).round(2)
-    out["LTC Uplift"]        = pd.to_numeric(df["LTC_Uplift"],          errors="coerce").fillna(0).round(2)
-    out["Retention"]         = pd.to_numeric(df["Retention_Credit"],    errors="coerce").fillna(0).round(2)
-    out["Complete/Ref"]      = pd.to_numeric(df["Complete_Credit"],     errors="coerce").fillna(0).round(2)
-    out["Total Credited"]    = pd.to_numeric(df["Total_Credited"],      errors="coerce").fillna(0).round(2)
-    out["Endorsed App"]      = df.get("Endorsed_App_Flag", 0).astype(int)
-    out["In Complete"]       = df.get("In_Complete",       0).astype(int)
-
-    out = out.sort_values(["Segment", "Leader", "Rep", "Close Date"], na_position="last")
-
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        out.to_excel(writer, sheet_name="CW Deal Detail", index=False)
-        ws = writer.sheets["CW Deal Detail"]
-        # Auto-size columns
-        for col_cells in ws.columns:
-            max_len = max((len(str(c.value)) for c in col_cells if c.value is not None), default=8)
-            ws.column_dimensions[col_cells[0].column_letter].width = min(max_len + 2, 50)
-    buf.seek(0)
-    return buf.getvalue()
-
-st.markdown("<br>", unsafe_allow_html=True)
-st.markdown("<div class='sh'>CW Deal Detail Download</div>", unsafe_allow_html=True)
-st.caption("One row per closed-won opportunity — use for account-level analysis. "
-           "Reflects the current period and filter selection.")
-
-_cw_master    = data.get("master", pd.DataFrame())
-_cw_det_file  = f"CW_Deal_Detail_{_safe_label}.xlsx"
-_cw_det_bytes = _build_cw_detail_excel(_cw_master, period_label)
-
-st.download_button(
-    label="Download CW Deal Detail",
-    data=_cw_det_bytes,
-    file_name=_cw_det_file,
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    help="Downloads all CW opportunities with account ID, account name, opp ID, incentive amounts.",
 )
 
 # ── Footer ─────────────────────────────────────────────────────────────────
