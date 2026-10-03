@@ -995,17 +995,14 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
         if _col not in ret.columns:
             ret[_col] = pd.Series(dtype=object)
     # ── Year-aware Final Month Closed filter ─────────────────────────────────
-    # The Retention SFDC report often has no standard date field (Final Month
-    # Closed is a text picklist), so the API may return ALL-TIME records.
-    # The field stores just the month name ("June", no year) on some orgs.
-    # Without a year check, isin(["June"]) would match June 2025 AND June 2026,
-    # inflating retention by ~$300k.  We accept four formats:
+    # Retention rows are included only when Final Month Closed explicitly matches
+    # the selected month/year.  Rows with a blank Final Month Closed are excluded.
+    # We accept three formats:
     #   1. "June 2026"  — explicit month-year (most reliable)
-    #   2. "June"       — month only, validated against Close Date year
-    #   3. "Jun 2026" / "Jun-2026" — short-month variants
-    #   4. blank/null   — Fall back to Close Date month+year.  Some SFDC orgs
-    #                     leave Final Month Closed unpopulated; without this
-    #                     fallback those records are silently excluded.
+    #   2. "Jun 2026" / "Jun-2026" — short-month variants
+    #   3. "June"       — month only, cross-validated against Close Date year
+    #                     (when Close Date column is present) to avoid matching
+    #                     the same month name from a prior year.
     _fmc = ret["Final Month Closed"].fillna("").astype(str).str.strip()
     _month_year_explicit = [f"{mn} {year}" for mn in month_names]          # ["June 2026"]
     _month_year_short    = [f"{mn[:3]} {year}" for mn in month_names]       # ["Jun 2026"]
@@ -1019,22 +1016,14 @@ def run_calc(cw_raw, ltc_raw, ret_raw, comp_raw,
     if "Close Date" in ret.columns:
         _close_dt  = pd.to_datetime(ret["Close Date"], errors="coerce")
         _close_yr  = _close_dt.dt.year
-        _close_mo  = _close_dt.dt.month
+        # Month-only FMC ("June") — cross-validate year against Close Date to avoid
+        # matching same month name from a prior year.
         _match_month_only = _fmc.isin(_month_only) & _close_yr.eq(year).fillna(False)
-        # Fallback: blank Final Month Closed → use Close Date month and year
-        _match_blank_fmc  = (_fmc.eq("") &
-                              _close_yr.eq(year).fillna(False) &
-                              _close_mo.isin(month_nums).fillna(False))
     else:
-        # Close Date not in the Retention report — cannot do year cross-validation.
-        # The API was called with a full-year (Jan–Dec year) range, so any rows
-        # returned with a prior-year close date should already be excluded by the
-        # API filter.  Accept all FMC-matching records.
-        # To enable strict year validation, add a "Close Date" column to the
-        # Salesforce Retention report and re-run.
+        # No Close Date column — accept month-only FMC values without year check.
         _match_month_only = _fmc.isin(_month_only)
-        _match_blank_fmc  = pd.Series(False, index=ret.index)
-    ret = ret[_match_explicit | _match_month_only | _match_blank_fmc].copy()
+    # Strictly use Final Month Closed — rows with blank FMC are excluded.
+    ret = ret[_match_explicit | _match_month_only].copy()
     ret["Opportunity Owner"] = ret["Opportunity Owner"].apply(normalize)
     mgr_col_ret = "Oppty Manager" if "Oppty Manager" in ret.columns else "Opportunity Owner: Manager"
     ret[mgr_col_ret] = ret[mgr_col_ret].apply(normalize)
